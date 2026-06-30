@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+import win32com.client
+import re
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+
+def extrair_nfs_dos_emails(dias_retroativos=7, pasta_alvo=None):
+    """
+    Conecta ao Outlook local, lê os e-mails dos últimos X dias,
+    localiza padrões de Notas Fiscais (NFs) no corpo/assunto e exporta para o Excel.
+    """
+    print("🔄 Conectando ao Outlook...")
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    except Exception as e:
+        print(f"❌ Erro ao conectar ao Outlook. Certifique-se de que o app desktop está aberto. Erro: {e}")
+        return
+
+    # 6 = código nativo da pasta Inbox (Caixa de Entrada)
+    inbox = outlook.GetDefaultFolder(6)
+    
+    # Se você organiza seus e-mails em subpastas (ex: uma pasta chamada "Cobrança DPSP")
+    if pasta_alvo:
+        try:
+            inbox = inbox.Folders[pasta_alvo]
+            print(f"📁 Buscando na subpasta: {pasta_alvo}")
+        except Exception:
+            print(f"⚠️ Subpasta '{pasta_alvo}' não encontrada. Buscando na Caixa de Entrada geral.")
+
+    # Restrição de tempo para o script rodar rápido e não processar anos de histórico à toa
+    data_limite = datetime.now() - timedelta(days=dias_retroativos)
+    str_data_limite = data_limite.strftime("%d/%m/%Y %H:%M %p")
+    
+    print(f"⏳ Filtrando e-mails recebidos desde: {data_limite.strftime('%d/%m/%Y')}")
+    emails = inbox.Items
+    emails.Sort("[ReceivedTime]", True)  # Ordena dos mais novos aos mais antigos
+    emails_filtrados = emails.Restrict(f"[ReceivedTime] >= '{str_data_limite}'")
+
+    dados_nfs = []
+    
+    # REGEX BRASIL: Busca termos como NF, Nota, NFe seguidos por números de 5 a 9 dígitos
+    # Também captura blocos puros de 6 a 9 dígitos isolados (padrão de NF no varejo)
+    padrao_regex = re.compile(r'(?:NF|NOTA|NFe|DANFE)?\s*#?\s*\b(\d{5,9})\b', re.IGNORECASE)
+
+    print("🔎 Analisando e-mails e minerando NFs...")
+    count_emails = 0
+    
+    for email in emails_filtrados:
+        if email.Class == 43:  # 43 garante que o item é um MailItem (e-mail puro)
+            count_emails += 1
+            assunto = email.Subject
+            corpo = email.Body
+            remetente = email.SenderName
+            data_recebimento = email.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Combina o assunto com o corpo para garantir que não vai perder nenhuma NF
+            texto_completo = f"{assunto} {corpo}"
+            
+            # Executa a varredura por Inteligência de Padrão (Regex)
+            nfs_encontradas = padrao_regex.findall(texto_completo)
+            
+            # Remove duplicadas da mesma nota dentro do mesmo e-mail
+            nfs_unicas = list(set(nfs_encontradas))
+            
+            for nf in nfs_unicas:
+                # Remove falsos positivos óbvios (anos correntes ou ramais padrões)
+                if nf in ['2024', '2025', '2026', '3060']:
+                    continue
+                    
+                dados_nfs.append({
+                    'Nota Fiscal': nf,
+                    'Assunto do E-mail': assunto,
+                    'Remetente': remetente,
+                    'Data de Recebimento': data_recebimento
+                })
+
+    print(f"✅ Processados {count_emails} e-mails.")
+    
+    if dados_nfs:
+        df = pd.DataFrame(dados_nfs)
+        df.drop_duplicates(inplace=True) # Limpa duplicidades globais
+        
+        nome_arquivo = f"NFs_Identificadas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        df.to_excel(nome_arquivo, index=False)
+        
+        print(f"📊 Sucesso! Planilha gerada com {len(df)} registros encontrados.")
+        print(f"📂 Arquivo salvo como: {os.path.abspath(nome_arquivo)}")
+    else:
+        print("❌ Nenhuma Nota Fiscal foi identificada nos e-mails do período selecionado.")
+
+if __name__ == "__main__":
+    # DIAS_RETROATIVOS: Altere para quantos dias para trás você quer escanear (ex: 5 dias)
+    # PASTA_ALVO: Se tiver uma pasta específica no Outlook, coloque o nome entre aspas (ex: "CR_DPSP")
+    extrair_nfs_dos_emails(dias_retroativos=5, pasta_alvo=None)
