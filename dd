@@ -1,46 +1,47 @@
 # ==============================================================================
-# 5. LÓGICA DE STATUS: COMPARAÇÃO SEQUENCIAL (MÊS VS MÊS SEGUINTE)
+# 8. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL (TOTAIS INTEGRAIS)
 # ==============================================================================
-print("Analisando o comportamento das combinações de NF e Valor contra o mês seguinte...")
+print("Gerando tabelas dinâmicas expandidas por Grupo, Reason e Triagem...")
 
-# 1. Identifica a linha do tempo ordenada dos meses presentes na base
-meses_ordenados = sorted(df_tracking_critico['MES_REFERENCIA'].unique())
-mes_mais_recente = meses_ordenados[-1]
-print(f"➔ Linha do tempo identificada: {meses_ordenados}")
+# Garante que a coluna 'Base Triagem' exista na memória para não quebrar o Pivot Table
+if 'Base Triagem' not in df_tracking_critico.columns:
+    df_tracking_critico['Base Triagem'] = 'Não Triado'
+else:
+    df_tracking_critico['Base Triagem'] = df_tracking_critico['Base Triagem'].fillna('Não Triado')
 
-# Criamos a chave identitária única arredondada para evitar erros de float
-df_tracking_critico['CHAVE_NF_VALOR'] = (
-    df_tracking_critico['NF'].astype(str) + '_V_' + df_tracking_critico['VALOR'].round(2).astype(str)
-)
+# ABA 1: Saldo Bruto por Frente Estratégica
+evolucao_saldo_frente = df_tracking_critico.pivot_table(
+    index='FRENTE_ESTRATEGICA',
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
 
-# Criamos uma lista para armazenar os sub-dataframes processados
-df_processado_lista = []
+# ABA 2: Visão Espelhada Expandida na Sequência Exata Solicitada
+# Estrutura: FRENTE -> STATUS -> GRUPO -> DESCRIÇÃO REASON CODE -> BASE TRIAGEM
+evolucao_resolvido_aberto = df_tracking_critico.pivot_table(
+    index=[
+        'FRENTE_ESTRATEGICA', 
+        'STATUS_RESOLUCAO', 
+        'GRUPO', 
+        'DESCRIÇÃO REASON CODE', 
+        'Base Triagem'
+    ],
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
 
-# 2. Varre cada mês comparando com o seu respectivo mês seguinte
-for i, mes_atual in enumerate(meses_ordenados):
-    df_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_atual].copy()
-    
-    # Se for o último mês da pasta (Junho), não há mês seguinte para comparar. Ele apenas soma tudo.
-    if mes_atual == mes_mais_recente:
-        df_mes['STATUS_RESOLUCAO'] = 'Não Resolvido'
-    else:
-        # Identifica qual é o mês imediatamente seguinte na sequência
-        mes_seguinte = meses_ordenados[i + 1]
-        
-        # Captura as chaves que estavam ativas no mês seguinte
-        chaves_mes_seguinte = df_tracking_critico[
-            df_tracking_critico['MES_REFERENCIA'] == mes_seguinte
-        ]['CHAVE_NF_VALOR'].unique()
-        
-        # Se a combinação exata continuou no mês seguinte ➔ 'Não Resolvido'. Se sumiu ➔ 'Resolvido'.
-        df_mes['STATUS_RESOLUCAO'] = np.where(
-            df_mes['CHAVE_NF_VALOR'].isin(chaves_mes_seguinte),
-            'Não Resolvido',
-            'Resolvido'
-        )
-        
-    df_processado_lista.append(df_mes)
-
-# Reconstrói a base unificada com os status corrigidos sequencialmente
-df_tracking_critico = pd.concat(df_processado_lista, ignore_index=True)
-df_tracking_critico = df_tracking_critico.drop(columns=['CHAVE_NF_VALOR'])
+# ABA 3: Impacto de DSO Consolidado Expandido na mesma Estrutura Hierárquica
+evolucao_dso_pendente = df_tracking_critico.pivot_table(
+    index=[
+        'FRENTE_ESTRATEGICA', 
+        'STATUS_RESOLUCAO', 
+        'GRUPO', 
+        'DESCRIÇÃO REASON CODE', 
+        'Base Triagem'
+    ],
+    columns='MES_REFERENCIA',
+    values='EOM DSO IMPACT',
+    aggfunc='sum'
+).fillna(0)
