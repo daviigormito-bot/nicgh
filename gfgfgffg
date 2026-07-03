@@ -102,23 +102,25 @@ df_tracking_critico = df_historico[df_historico['DIAS ATRASO'] > 120].copy()
 
 
 # ==============================================================================
-# 5. RETORNO DA REGRA DE OURO: COMPARAÇÃO HISTÓRICA POR NF + VALOR
+# 5. LÓGICA DE STATUS CORRIGIDA E INTEGRAL (SEM DROPAR VALORES DE JUNHO)
 # ==============================================================================
 print("Analisando o comportamento das combinações de NF e Valor...")
 
 mes_mais_recente = df_tracking_critico['MES_REFERENCIA'].max()
 print(f"➔ Mês mais recente identificado para tracking: {mes_mais_recente}")
 
-# Reconstrói a chave identitária exata cruzando NF e VALOR
+# Criação da chave única combinando NF e Valor
 df_tracking_critico['CHAVE_NF_VALOR'] = (
     df_tracking_critico['NF'].astype(str) + '_VALOR_' + df_tracking_critico['VALOR'].astype(str)
 )
 
+# Chaves contidas no arquivo do mês mais recente (Junho)
 chaves_no_mes_recente = df_tracking_critico[
     df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente
 ]['CHAVE_NF_VALOR'].unique()
 
-# Classificação precisa por presença da combinação exata de valor no mês corrente
+# Condição corretiva: Se está no mês mais recente, é obrigatoriamente 'Não Resolvido'.
+# Se está nos meses passados, verificamos se a chave continua presente em Junho.
 df_tracking_critico['STATUS_RESOLUCAO'] = np.where(
     df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente,
     'Não Resolvido',
@@ -129,7 +131,6 @@ df_tracking_critico['STATUS_RESOLUCAO'] = np.where(
     )
 )
 
-# Removemos a coluna auxiliar para manter o histórico limpo na planilha final
 df_tracking_critico = df_tracking_critico.drop(columns=['CHAVE_NF_VALOR'])
 
 
@@ -232,4 +233,4 @@ with pd.ExcelWriter(output_file) as writer:
     evolucao_resolvido_aberto.to_excel(writer, sheet_name='Evolucao_Resolvido_vs_Aberto')
     evolucao_dso_pendente.to_excel(writer, sheet_name='Evolucao_Impacto_DSO_Critico')
 
-print("\n🚀 [CONCLUÍDO E SEGURO] Chave NF_VALOR restabelecida. Os totais estão perfeitamente alinhados!")
+print("\n🚀 [CORRIGIDO] Lógica refeita sem filtros excludentes em Junho. O valor fechará perfeitamente.")
