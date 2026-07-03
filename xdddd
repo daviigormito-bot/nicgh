@@ -1,0 +1,53 @@
+# ==============================================================================
+# # 6. GERANDO A ABA EXCLUSIVA DE LINHAS ÚNICAS (DEDUP)
+# ==============================================================================
+print("Agrupando a base para garantir que cada NF/Valor apareça apenas uma vez...")
+
+# Ordenamos a base para que a foto do mês mais recente de cada NF fique no topo da pilha
+df_ordenado = df_tracking_critico.sort_values(by=['NF', 'VALOR', 'MES_REFERENCIA'], ascending=[True, True, False])
+
+# Eliminamos as duplicidades históricas, mantendo a linha mais recente de cada combinação NF/Valor
+df_linhas_unicas = df_ordenado.drop_duplicates(subset=['NF', 'VALOR'], keep='first').copy()
+df_linhas_unicas = df_linhas_unicas.rename(columns={'MES_REFERENCIA': 'ULTIMO_MES_VISTO'})
+
+
+# ==============================================================================
+# # 7. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL
+# ==============================================================================
+print("Cruzando dados para gerar as tabelas dinâmicas de evolução...")
+
+evolucao_valor_critico = df_tracking_critico.pivot_table(
+    index=['FRENTE_ESTRATEGICA', 'STATUS_RESOLUCAO'],
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+evolucao_dso_pendente = df_tracking_critico[df_tracking_critico['STATUS_RESOLUCAO'] == 'Não Resolvido'].pivot_table(
+    index='FRENTE_ESTRATEGICA',
+    columns='MES_REFERENCIA',
+    values='EOM DSO IMPACT',
+    aggfunc='sum'
+).fillna(0)
+
+
+# ==============================================================================
+# # 8. EXPORTAÇÃO FINAL DOS RESULTADOS PARA O EXCEL
+# ==============================================================================
+output_file = os.path.join(path, 'TRACKING_CRITICO_AR_RR.xlsx')
+print(f"Exportando resultados finais para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    # Aba 1: Painel Limpo -> Cada NF/Valor aparece uma única vez com a sua classificação final
+    df_linhas_unicas.to_excel(writer, sheet_name='Painel_Consolidado_Unico', index=False)
+    
+    # Aba 2: Histórico completo mês a mês para consultas de auditoria
+    df_tracking_critico.to_excel(writer, sheet_name='Historico_Completo_Mês_a_Mês', index=False)
+    
+    # Aba 3: Comparativo de evolução financeira do que foi baixado vs aberto
+    evolucao_valor_critico.to_excel(writer, sheet_name='Evolucao_Saldo_Critico')
+    
+    # Aba 4: Onde o calo aperta -> Impacto de DSO gerado pelo que continua aberto no mês atual
+    evolucao_dso_pendente.to_excel(writer, sheet_name='DSO_Ativo_Nao_Resolvido')
+
+print("\n🚀 [CONCLUÍDO] Bloco final executado! Arquivo gerado com sucesso.")
