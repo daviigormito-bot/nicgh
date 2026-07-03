@@ -1,0 +1,182 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+
+# ==============================================================================
+# # 1. MAPEAMENTO DE DIRETÓRIOS E ARQUIVOS HISTÓRICOS (PARTE 1)
+# ==============================================================================
+# Caminho da sua pasta no OneDrive
+path = r'C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\projetoretorno'
+
+# Busca todos os arquivos que começam com 'base_' na pasta
+all_files = glob.glob(os.path.join(path, "base_*.xlsx"))
+
+# Garante a ordem cronológica perfeita: 202604 -> 202605 -> 202606
+all_files.sort()
+
+# Lista de colunas obrigatórias para a análise estratégica de AR e DSO
+colunas_obrigatorias = [
+    'GRUPO', 'IBP Name', 'Customer', 'CLIENTE', 'DOC.NUMBER', 'NF', 
+    'DOC.TYPE', 'POSTING', 'VALOR', 'PRAZO DE PAGAMENTO', 'REASON CODE', 
+    'DESCRIÇÃO REASON CODE', 'DIAS AT', "TODAY'S DSO IMPACT", 
+    'EOM DSO IMPACT', 'DSO IMPACT FY'
+]
+
+li = []
+print("--- Iniciando Importação das Bases de Dados ---")
+
+for filename in all_files:
+    nome_arquivo = os.path.basename(filename)
+    
+    # Extrai o código numérico exato do nome (ex: '202604')
+    codigo_mes = nome_arquivo.split("_")[-1].replace(".xlsx", "")
+    ano_mes_formatado = f"{codigo_mes[:4]}-{codigo_mes[4:]}"
+    
+    try:
+        # 1. Lê apenas a linha de cabeçalho do arquivo atual para checagem
+        df_headers = pd.read_excel(filename, sheet_name=0, nrows=0)
+        
+        # 2. Procura dinamicamente por qualquer coluna que contenha "triagem" no nome (ignora case)
+        coluna_triagem_real = [c for c in df_headers.columns if 'triagem' in c.lower()]
+        
+        # 3. Monta a lista de colunas a ler mapeando o que de fato existe neste arquivo
+        colunas_para_ler = [
+            c for c in df_headers.columns 
+            if c.strip() in colunas_obrigatorias or c in coluna_triagem_real
+        ]
+        
+        # 4. Carrega o arquivo completo contendo apenas o que precisamos
+        temp_df = pd.read_excel(filename, sheet_name=0, usecols=colunas_para_ler)
+        
+        # 5. Remove espaços em branco invisíveis do nome de todas as colunas carregadas
+        temp_df.columns = temp_df.columns.str.strip()
+        
+        # 6. Se achou a coluna de triagem (mesmo escrita diferente), padroniza o nome na memória
+        if coluna_triagem_real:
+            nome_original_triagem = coluna_triagem_real[0].strip()
+            temp_df = temp_df.rename(columns={nome_original_triagem: 'Base Triagem'})
+        
+        # Cria a tag do mês correspondente
+        temp_df['MES_REFERENCIA'] = ano_mes_formatado
+        li.append(temp_df)
+        print(f"✅ Sucesso: {nome_arquivo} ➔ Competência: {ano_mes_formatado}")
+        
+    except Exception as e:
+        print(f"❌ Erro crítico ao ler o arquivo {nome_arquivo}: {e}")
+
+# Consolidação das bases na memória
+if li:
+    df_historico = pd.concat(li, axis=0, ignore_index=True)
+    print(f"\n➔ Consolidação concluída! Linhas totais na memória: {len(df_historico)}")
+else:
+    print("⚠️ Erro: Nenhum arquivo foi carregado. Verifique os caminhos.")
+    exit()
+
+
+# ==============================================================================
+# # 2. TRATAMENTO DE VALORES FINANCEIROS E FORMATOS (DATA CLEANING)
+# ==============================================================================
+print("\nIniciando o tratamento numérico dos dados...")
+
+# Garante que a coluna de triagem exista (mesmo que vazia em algum mês) para não quebrar as regras
+if 'Base Triagem' not in df_historico.columns:
+    df_historico['Base Triagem'] = 'PENDENTE TRIAGEM'
+
+# Padronizar a coluna VALOR
+if 'VALOR' in df_historico.columns:
+    df_historico['VALOR'] = pd.to_numeric(
+        df_historico['VALOR'].astype(str)
+        .str.replace('.', '', regex=False)
+        .str.replace(',', '.', regex=False), 
+        errors='coerce'
+    ).fillna(0)
+
+# Padronizar as colunas oficiais de impacto no DSO
+dso_cols = ["TODAY'S DSO IMPACT", "EOM DSO IMPACT", "DSO IMPACT FY"]
+for col in dso_cols:
+    if col in df_historico.columns:
+        df_historico[col] = pd.to_numeric(
+            df_historico[col].astype(str)
+            .str.replace('.', '', regex=False)
+            .str.replace(',', '.', regex=False), 
+            errors='coerce'
+        ).fillna(0)
+
+# Garantir tratamento numérico para DIAS AT
+if 'DIAS AT' in df_historico.columns:
+    df_historico['DIAS AT'] = pd.to_numeric(df_historico['DIAS AT'], errors='coerce').fillna(0)
+
+
+# ==============================================================================
+# # 3. ÁRVORE DE DECISÃO: DEFINIÇÃO DE RESPONSÁVEIS E PLANOS DE AÇÃO
+# ==============================================================================
+print("Aplicando mapeamento de responsabilidades sobre a coluna 'Base Triagem'...")
+
+# Condições baseadas estritamente nos status oficiais identificados
+conditions = [
+    df_historico['Base Triagem'].isin([
+        'AR - ENVIAR CANHOTO DA NFD - TRANSPORTADORA DESCONHECE', 
+        'R&R - AGUARDANDO RETORNO DA TRANSPORTADORA', 
+        'TRANSPORTADORA CORRIGIR MANIFESTAÇÃO'
+    ]),
+    df_historico['Base Triagem'].isin(['AR - COBRAR CANHOTO DO CLIENTE']),
+    df_historico['Base Triagem'].isin(['R&R - COBRAR MANIFESTAÇÃO', 'R&R - COBRAR MANIFESTAÇÃO - CANHOTO ENVIADO']),
+    df_historico['Base Triagem'].isin(['CO - ENCERRAR MANIFESTAÇÃO', 'R&R - PROCESSAR', 'AR - CTLM - VALIDAR INFORMAÇÃO']),
+    df_historico['Base Triagem'] == 'PROCESSO FINALIZADO'
+]
+
+# Definição das áreas e planos operacionais correspondentes
+owners = ['LOGÍSTICA / TRANSPORTES', 'COBRANÇA / PORTAL', 'TIME DE VENDAS', 'FINANCEIRO INTERNO', 'CONCLUÍDO']
+actions = [
+    'Cobrar resposta ou correção operacional de canhoto com o transportador',
+    'Exigir comprovante físico de devolução direto com o cliente corporativo',
+    'Solicitar abertura ou regularização sistêmica da manifestação comercial',
+    'Acompanhar SLA interno de auditoria, validação CTLM ou processamento SAP',
+    'Disputa encerrada - Baixa efetuada'
+]
+
+# Injeção das colunas estratégicas no DataFrame consolidado
+df_historico['RESPONSÁVEL_TRATATIVA'] = np.select(conditions, owners, default='PENDENTE TRIAGEM')
+df_historico['PLANO_DE_AÇÃO'] = np.select(conditions, actions, default='Revisar entrada na Base Triagem')
+
+
+# ==============================================================================
+# # 4. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL
+# ==============================================================================
+print("Cruzando dados para gerar visão de evolução histórica...")
+
+# Tabela Dinâmica 1: Evolução do Saldo Financeiro Absoluto Travado por Área (VALOR)
+evolucao_valor = df_historico.pivot_table(
+    index='RESPONSÁVEL_TRATATIVA',
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+# Tabela Dinâmica 2: Evolução do Impacto no DSO de Fechamento de Mês (EOM DSO IMPACT)
+evolucao_dso = df_historico.pivot_table(
+    index='RESPONSÁVEL_TRATATIVA',
+    columns='MES_REFERENCIA',
+    values='EOM DSO IMPACT',
+    aggfunc='sum'
+).fillna(0)
+
+
+# ==============================================================================
+# # 5. EXPORTAÇÃO FINAL DOS RESULTADOS PARA O EXCEL
+# ==============================================================================
+output_file = os.path.join(path, 'RELATORIO_ESTRATEGICO_RETORNO.xlsx')
+print(f"Exportando resultados finais para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    # Aba 1: Toda a base histórica tagueada para filtros analíticos
+    df_historico.to_excel(writer, sheet_name='Base_Historica_Tratada', index=False)
+    
+    # Aba 2: Evolução do montante em dinheiro preso por área responsável
+    evolucao_valor.to_excel(writer, sheet_name='Evolucao_Saldo_Financeiro')
+    
+    # Aba 3: Evolução do real impacto gerado no DSO por cada gargalo operacional
+    evolucao_dso.to_excel(writer, sheet_name='Evolucao_Impacto_DSO')
+
+print("\n🚀 [CONCLUÍDO] O arquivo 'RELATORIO_ESTRATEGICO_RETORNO.xlsx' foi gerado e está pronto na sua pasta!")
