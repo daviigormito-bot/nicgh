@@ -1,60 +1,45 @@
-import pandas as pd
-import numpy as np
-import glob
-import os
-
 # ==============================================================================
-# # 1. MAPEAMENTO DE DIRETÓRIOS E ARQUIVOS HISTÓRICOS (AJUSTADO PARA A SUA PASTA)
+# 7. LÓGICA DE PARETO CONSOLIDADA COMPLETA (BASE EXCLUSIVA DO MÊS CORRENTE)
 # ==============================================================================
-# Cole o caminho exato da sua pasta do OneDrive aqui
-path = r'C:\Users\...\Desktop\projetoretorno' 
+print("Calculando análise de Pareto estritamente para a base do mês recente...")
 
-# Busca exatamente o padrão da sua foto
-all_files = glob.glob(os.path.join(path, "base_*.xlsx"))
+# Filtra a base para que o Pareto final contenha APENAS as linhas de Junho
+df_base_pareto_aberta = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente].copy()
 
-# Garante a ordem cronológica perfeita: 202604 -> 202605 -> 202606
-all_files.sort()
+df_calculo_pareto = (
+    df_base_pareto_aberta.groupby(['GRUPO', 'REASON CODE'], dropna=False)['VALOR']
+    .sum()
+    .reset_index()
+    .rename(columns={'VALOR': 'Soma_Valor_Grupo_Reason_Atual'})
+)
 
-# Lista de colunas oficiais confirmadas nos passos anteriores
-colunas_obrigatorias = [
-    'GRUPO', 'IBP Name', 'Customer', 'CLIENTE', 'DOC.NUMBER', 'NF', 
-    'DOC.TYPE', 'POSTING', 'VALOR', 'PRAZO DE PAGAMENTO', 'REASON CODE', 
-    'DESCRIÇÃO REASON CODE', 'DIAS AT', 'TODAY\'S DSO IMPACT', 
-    'EOM DSO IMPACT', 'DSO IMPACT FY', 'Base Triagem'
-]
+df_calculo_pareto = df_calculo_pareto.sort_values(by='Soma_Valor_Grupo_Reason_Atual', ascending=False).reset_index(drop=True)
 
-li = []
-for filename in all_files:
-    nome_arquivo = os.path.basename(filename)
-    
-    # Extrai o código numérico exato do nome (ex: de 'base_202604' extrai '202604')
-    # O split divide no '_' e depois remove a extensão '.xlsx'
-    codigo_mes = nome_arquivo.split("_")[-1].replace(".xlsx", "")
-    
-    # Formata de forma legível para os relatórios (ex: '2026-04')
-    ano_mes_formatado = f"{codigo_mes[:4]}-{codigo_mes[4:]}"
-    
-    print(f"Importando: {nome_arquivo} ➔ Competência mapeada: {ano_mes_formatado}")
-    
-    try:
-        # Lê a primeira aba (índice 0), filtrando pelas colunas que existem na lista
-        temp_df = pd.read_excel(
-            filename, 
-            sheet_name=0, 
-            usecols=lambda c: c in colunas_obrigatorias
-        )
-        
-        # Cria a chave temporal que guiará a análise de evolução
-        temp_df['MES_REFERENCIA'] = ano_mes_formatado
-        li.append(temp_df)
-        
-    except Exception as e:
-        print(f"❌ Erro ao ler o arquivo {nome_arquivo}: {e}")
-
-# Consolidação final na memória
-if li:
-    df_historico = pd.concat(li, axis=0, ignore_index=True)
-    print(f"\n✅ Consolidação concluída com sucesso!")
-    print(f"Meses carregados na linha do tempo: {df_historico['MES_REFERENCIA'].unique().tolist()}")
+total_junho_pareto = df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'].sum()
+if total_junho_pareto > 0:
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = (df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'] / total_junho_pareto).cumsum()
 else:
-    print("⚠️ Nenhum arquivo encontrado. Verifique se o caminho da pasta 'path' está correto.")
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = 0
+
+df_calculo_pareto['Classificacao_Pareto'] = np.where(
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'].shift(1, fill_value=0) < 0.80,
+    'Top 80% (Foco Direto)',
+    'Cauda Longa (Outros 20%)'
+)
+
+# Cruza os resultados do cálculo apenas com as faturas do mês corrente
+df_base_pareto_aberta = pd.merge(
+    df_base_pareto_aberta, 
+    df_calculo_pareto, 
+    on=['GRUPO', 'REASON CODE'], 
+    how='left'
+)
+
+df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'] = df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'].fillna(0)
+df_base_pareto_aberta['%_Acumulada_Grupo_Reason'] = df_base_pareto_aberta['%_Acumulada_Grupo_Reason'].fillna(1.0)
+df_base_pareto_aberta['Classificacao_Pareto'] = df_base_pareto_aberta['Classificacao_Pareto'].fillna('Cauda Longa (Outros 20%)')
+
+df_base_pareto_aberta = df_base_pareto_aberta.sort_values(
+    by=['Soma_Valor_Grupo_Reason_Atual', 'VALOR'], 
+    ascending=[False, False]
+)
