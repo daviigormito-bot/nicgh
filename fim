@@ -1,0 +1,204 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+
+# ==============================================================================
+# 1. MAPEAMENTO DE DIRETÓRIOS E ARQUIVOS HISTÓRICOS
+# ==============================================================================
+# Caminho da sua pasta no OneDrive
+path = r'C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\projetoretorno'
+
+# Busca todos os arquivos mensais na pasta
+all_files = glob.glob(os.path.join(path, "base_*.xlsx"))
+all_files.sort()
+
+colunas_obrigatorias = [
+    'GRUPO', 'IBP Name', 'Customer', 'CLIENTE', 'DOC.NUMBER', 'NF', 
+    'DOC.TYPE', 'POSTING', 'VALOR', 'PRAZO DE PAGAMENTO', 'REASON CODE', 
+    'DESCRIÇÃO REASON CODE', 'DIAS AT', "TODAY'S DSO IMPACT", 
+    'EOM DSO IMPACT', 'DSO IMPACT FY', 'Text'
+]
+
+li = []
+print("--- Iniciando Importação das Bases de Dados ---")
+
+for filename in all_files:
+    nome_arquivo = os.path.basename(filename)
+    codigo_mes = nome_arquivo.split("_")[-1].replace(".xlsx", "")
+    ano_mes_formatado = f"{codigo_mes[:4]}-{codigo_mes[4:]}"
+    
+    try:
+        df_headers = pd.read_excel(filename, sheet_name=0, nrows=0)
+        coluna_triagem_real = [c for c in df_headers.columns if 'triagem' in c.lower()]
+        
+        colunas_para_ler = [
+            c for c in df_headers.columns 
+            if c.strip() in colunas_obrigatorias or c in coluna_triagem_real
+        ]
+        
+        temp_df = pd.read_excel(filename, sheet_name=0, usecols=colunas_para_ler)
+        temp_df.columns = temp_df.columns.str.strip()
+        
+        if coluna_triagem_real:
+            nome_original_triagem = coluna_triagem_real[0].strip()
+            temp_df = temp_df.rename(columns={nome_original_triagem: 'Base Triagem'})
+        
+        temp_df['MES_REFERENCIA'] = ano_mes_formatado
+        li.append(temp_df)
+        print(f"✅ Sucesso: {nome_arquivo} ➔ Competência: {ano_mes_formatado}")
+        
+    except Exception as e:
+        print(f"❌ Erro crítico ao ler o arquivo {nome_arquivo}: {e}")
+
+if li:
+    df_historico = pd.concat(li, axis=0, ignore_index=True)
+    print(f"\n➔ Consolidação concluída! Linhas totais na memória: {len(df_historico)}")
+else:
+    print("⚠️ Erro: Nenhum arquivo foi carregado. Verifique os caminhos.")
+    exit()
+
+
+# ==============================================================================
+# 2. TRATAMENTO DE VALORES FINANCEIROS E FORMATOS (DATA CLEANING)
+# ==============================================================================
+print("\nIniciando o tratamento numérico dos dados...")
+
+if 'VALOR' in df_historico.columns:
+    df_historico['VALOR'] = pd.to_numeric(
+        df_historico['VALOR'].astype(str)
+        .str.replace('.', '', regex=False)
+        .str.replace(',', '.', regex=False), 
+        errors='coerce'
+    ).fillna(0)
+
+dso_cols = ["TODAY'S DSO IMPACT", "EOM DSO IMPACT", "DSO IMPACT FY"]
+for col in dso_cols:
+    if col in df_historico.columns:
+        df_historico[col] = pd.to_numeric(
+            df_historico[col].astype(str)
+            .str.replace('.', '', regex=False)
+            .str.replace(',', '.', regex=False), 
+            errors='coerce'
+        ).fillna(0)
+
+if 'DIAS AT' in df_historico.columns:
+    df_historico['DIAS AT'] = pd.to_numeric(df_historico['DIAS AT'], errors='coerce').fillna(0)
+
+
+# ==============================================================================
+# 3. CLASSIFICAÇÃO DA RESPONSABILIDADE PELA COLUNA 'Text' (AR vs R&R)
+# ==============================================================================
+print("Aplicando classificação de responsabilidade baseada na coluna 'Text'...")
+
+if 'Text' in df_historico.columns:
+    df_historico['Text'] = df_historico['Text'].astype(str).str.strip()
+else:
+    coluna_text_real = [c for c in df_historico.columns if 'text' in c.lower()]
+    if coluna_text_real:
+        df_historico['Text'] = df_historico[coluna_text_real[0]].astype(str).str.strip()
+
+# REGRA DE OURO: Começa com 'AR' vai para AR, caso contrário R&R
+df_historico['FRENTE_ESTRATEGICA'] = np.where(
+    df_historico['Text'].str.startswith('AR', na=False), 
+    'AR', 
+    'R&R'
+)
+
+
+# ==============================================================================
+# 4. FILTRO DE CORTE DO TRACKING: APENAS LINHAS CRÍTICAS (> 60 DIAS)
+# ==============================================================================
+print("Filtrando base de dados: Foco exclusivo em faturas com > 60 dias em atraso...")
+df_tracking_critico = df_historico[df_historico['DIAS AT'] > 60].copy()
+
+
+# ==============================================================================
+# 5. LÓGICA DE COMPARAÇÃO HISTÓRICA: STATUS DE RESOLUÇÃO (NF + VALOR IGUAIS)
+# ==============================================================================
+print("Analisando o comportamento das NFs e Valores para determinar a resolução...")
+
+mes_mais_recente = df_tracking_critico['MES_REFERENCIA'].max()
+print(f"➔ Mês mais recente identificado para tracking: {mes_mais_recente}")
+
+# Cria a chave identitária combinada
+df_tracking_critico['CHAVE_NF_VALOR'] = (
+    df_tracking_critico['NF'].astype(str) + '_VALOR' + df_tracking_critico['VALOR'].astype(str)
+)
+
+chaves_no_mes_recente = df_tracking_critico[
+    df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente
+]['CHAVE_NF_VALOR'].unique()
+
+# Classificação da regra de negócio
+df_tracking_critico['STATUS_RESOLUCAO'] = np.where(
+    df_tracking_critico['CHAVE_NF_VALOR'].isin(chaves_no_mes_recente),
+    'Não Resolvido',
+    'Resolvido'
+)
+
+df_tracking_critico = df_tracking_critico.drop(columns=['CHAVE_NF_VALOR'])
+
+
+# ==============================================================================
+# 6. GERANDO A ABA EXCLUSIVA DE LINHAS ÚNICAS (DEDUP)
+# ==============================================================================
+print("Agrupando a base para garantir que cada NF/Valor apareça apenas uma vez...")
+
+df_ordenado = df_tracking_critico.sort_values(by=['NF', 'VALOR', 'MES_REFERENCIA'], ascending=[True, True, False])
+df_linhas_unicas = df_ordenado.drop_duplicates(subset=['NF', 'VALOR'], keep='first').copy()
+df_linhas_unicas = df_linhas_unicas.rename(columns={'MES_REFERENCIA': 'ULTIMO_MES_VISTO'})
+
+
+# ==============================================================================
+# 7. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL
+# ==============================================================================
+print("Cruzando dados para gerar as tabelas dinâmicas de evolução...")
+
+# ABA 1: Apenas por Frente Estratégica
+evolucao_saldo_frente = df_tracking_critico.pivot_table(
+    index='FRENTE_ESTRATEGICA',
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+# ABA 2: Espelhada, incluindo quebra de Status de Resolução
+evolucao_resolvido_aberto = df_tracking_critico.pivot_table(
+    index=['FRENTE_ESTRATEGICA', 'STATUS_RESOLUCAO'],
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+# Matriz de Impacto de DSO Pendente (Risco Ativo)
+df_nao_resolvido = df_tracking_critico[df_tracking_critico['STATUS_RESOLUCAO'] == 'Não Resolvido']
+
+if not df_nao_resolvido.empty:
+    evolucao_dso_pendente = df_nao_resolvido.pivot_table(
+        index='FRENTE_ESTRATEGICA',
+        columns='MES_REFERENCIA',
+        values='EOM DSO IMPACT',
+        aggfunc='sum'
+    ).fillna(0)
+else:
+    evolucao_dso_pendente = pd.DataFrame(columns=['FRENTE_ESTRATEGICA'])
+
+
+# ==============================================================================
+# 8. EXPORTAÇÃO FINAL DOS RESULTADOS PARA O EXCEL DOS TRACKINGS
+# ==============================================================================
+output_file = os.path.join(path, 'TRACKING_CRITICO_AR_RR.xlsx')
+print(f"Exportando resultados finais consolidados para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    # Abas Operacionais Detalhadas
+    df_linhas_unicas.to_excel(writer, sheet_name='Painel_Consolidado_Unico', index=False)
+    df_tracking_critico.to_excel(writer, sheet_name='Historico_Completo_Mês_a_Mês', index=False)
+    
+    # Abas Executivas de Resumo / Matrizes de Tendência
+    evolucao_saldo_frente.to_excel(writer, sheet_name='Evolucao_Saldo_Critico')
+    evolucao_resolvido_aberto.to_excel(writer, sheet_name='Evolucao_Resolvido_vs_Aberto')
+    evolucao_dso_pendente.to_excel(writer, sheet_name='Evolucao_Impacto_DSO_Critico')
+
+print("\n🚀 [CONCLUÍDO] Arquivo único oficial 'TRACKING_CRITICO_AR_RR.xlsx' gerado com sucesso!")
