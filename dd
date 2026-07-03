@@ -1,45 +1,46 @@
 # ==============================================================================
-# 7. LÓGICA DE PARETO CONSOLIDADA COMPLETA (BASE EXCLUSIVA DO MÊS CORRENTE)
+# 5. LÓGICA DE STATUS: COMPARAÇÃO SEQUENCIAL (MÊS VS MÊS SEGUINTE)
 # ==============================================================================
-print("Calculando análise de Pareto estritamente para a base do mês recente...")
+print("Analisando o comportamento das combinações de NF e Valor contra o mês seguinte...")
 
-# Filtra a base para que o Pareto final contenha APENAS as linhas de Junho
-df_base_pareto_aberta = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente].copy()
+# 1. Identifica a linha do tempo ordenada dos meses presentes na base
+meses_ordenados = sorted(df_tracking_critico['MES_REFERENCIA'].unique())
+mes_mais_recente = meses_ordenados[-1]
+print(f"➔ Linha do tempo identificada: {meses_ordenados}")
 
-df_calculo_pareto = (
-    df_base_pareto_aberta.groupby(['GRUPO', 'REASON CODE'], dropna=False)['VALOR']
-    .sum()
-    .reset_index()
-    .rename(columns={'VALOR': 'Soma_Valor_Grupo_Reason_Atual'})
+# Criamos a chave identitária única arredondada para evitar erros de float
+df_tracking_critico['CHAVE_NF_VALOR'] = (
+    df_tracking_critico['NF'].astype(str) + '_V_' + df_tracking_critico['VALOR'].round(2).astype(str)
 )
 
-df_calculo_pareto = df_calculo_pareto.sort_values(by='Soma_Valor_Grupo_Reason_Atual', ascending=False).reset_index(drop=True)
+# Criamos uma lista para armazenar os sub-dataframes processados
+df_processado_lista = []
 
-total_junho_pareto = df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'].sum()
-if total_junho_pareto > 0:
-    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = (df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'] / total_junho_pareto).cumsum()
-else:
-    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = 0
+# 2. Varre cada mês comparando com o seu respectivo mês seguinte
+for i, mes_atual in enumerate(meses_ordenados):
+    df_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_atual].copy()
+    
+    # Se for o último mês da pasta (Junho), não há mês seguinte para comparar. Ele apenas soma tudo.
+    if mes_atual == mes_mais_recente:
+        df_mes['STATUS_RESOLUCAO'] = 'Não Resolvido'
+    else:
+        # Identifica qual é o mês imediatamente seguinte na sequência
+        mes_seguinte = meses_ordenados[i + 1]
+        
+        # Captura as chaves que estavam ativas no mês seguinte
+        chaves_mes_seguinte = df_tracking_critico[
+            df_tracking_critico['MES_REFERENCIA'] == mes_seguinte
+        ]['CHAVE_NF_VALOR'].unique()
+        
+        # Se a combinação exata continuou no mês seguinte ➔ 'Não Resolvido'. Se sumiu ➔ 'Resolvido'.
+        df_mes['STATUS_RESOLUCAO'] = np.where(
+            df_mes['CHAVE_NF_VALOR'].isin(chaves_mes_seguinte),
+            'Não Resolvido',
+            'Resolvido'
+        )
+        
+    df_processado_lista.append(df_mes)
 
-df_calculo_pareto['Classificacao_Pareto'] = np.where(
-    df_calculo_pareto['%_Acumulada_Grupo_Reason'].shift(1, fill_value=0) < 0.80,
-    'Top 80% (Foco Direto)',
-    'Cauda Longa (Outros 20%)'
-)
-
-# Cruza os resultados do cálculo apenas com as faturas do mês corrente
-df_base_pareto_aberta = pd.merge(
-    df_base_pareto_aberta, 
-    df_calculo_pareto, 
-    on=['GRUPO', 'REASON CODE'], 
-    how='left'
-)
-
-df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'] = df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'].fillna(0)
-df_base_pareto_aberta['%_Acumulada_Grupo_Reason'] = df_base_pareto_aberta['%_Acumulada_Grupo_Reason'].fillna(1.0)
-df_base_pareto_aberta['Classificacao_Pareto'] = df_base_pareto_aberta['Classificacao_Pareto'].fillna('Cauda Longa (Outros 20%)')
-
-df_base_pareto_aberta = df_base_pareto_aberta.sort_values(
-    by=['Soma_Valor_Grupo_Reason_Atual', 'VALOR'], 
-    ascending=[False, False]
-)
+# Reconstrói a base unificada com os status corrigidos sequencialmente
+df_tracking_critico = pd.concat(df_processado_lista, ignore_index=True)
+df_tracking_critico = df_tracking_critico.drop(columns=['CHAVE_NF_VALOR'])
