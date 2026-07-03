@@ -1,47 +1,183 @@
-# ==============================================================================
-# 8. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL (TOTAIS INTEGRAIS)
-# ==============================================================================
-print("Gerando tabelas dinâmicas expandidas por Grupo, Reason e Triagem...")
+import pandas as pd
+import numpy as np
+import glob
+import os
 
-# Garante que a coluna 'Base Triagem' exista na memória para não quebrar o Pivot Table
-if 'Base Triagem' not in df_tracking_critico.columns:
-    df_tracking_critico['Base Triagem'] = 'Não Triado'
+# ==============================================================================
+# 1. MAPEAMENTO DE DIRETÓRIOS E IMPORTAÇÃO TOTAL DE COLUNAS
+# ==============================================================================
+path = r'C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\projetoretorno'
+
+all_files = glob.glob(os.path.join(path, "base_*.xlsx"))
+all_files.sort()
+
+li = []
+print("--- Iniciando Importação de 100% das Colunas das Bases ---")
+
+for filename in all_files:
+    nome_arquivo = os.path.basename(filename)
+    codigo_mes = nome_arquivo.split("_")[-1].replace(".xlsx", "")
+    ano_mes_formatado = f"{codigo_mes[:4]}-{codigo_mes[4:]}"
+    
+    try:
+        # Lendo o arquivo completo (sem restrição de usecols) para preservar TODAS as colunas
+        temp_df = pd.read_excel(filename, sheet_name=0)
+        temp_df.columns = temp_df.columns.str.strip()
+        
+        # Padroniza apenas o nome da coluna de triagem se ela existir, sem dropar o resto
+        coluna_triagem_real = [c for c in temp_df.columns if 'triagem' in c.lower()]
+        if coluna_triagem_real:
+            temp_df = temp_df.rename(columns={coluna_triagem_real[0]: 'Base Triagem'})
+        
+        temp_df['MES_REFERENCIA'] = ano_mes_formatado
+        li.append(temp_df)
+        print(f"✅ Sucesso Integral: {nome_arquivo} ➔ Competência: {ano_mes_formatado}")
+        
+    except Exception as e:
+        print(f"❌ Erro crítico ao ler o arquivo {nome_arquivo}: {e}")
+
+if li:
+    # pd.concat preserva a união de todas as colunas encontradas nos arquivos
+    df_historico = pd.concat(li, axis=0, ignore_index=True)
+    print(f"\n➔ Consolidação concluída! Linhas totais: {len(df_historico)} | Colunas totais: {len(df_historico.columns)}")
 else:
-    df_tracking_critico['Base Triagem'] = df_tracking_critico['Base Triagem'].fillna('Não Triado')
+    print("⚠️ Erro: Nenhum arquivo foi carregado. Verifique os caminhos.")
+    exit()
 
-# ABA 1: Saldo Bruto por Frente Estratégica
-evolucao_saldo_frente = df_tracking_critico.pivot_table(
-    index='FRENTE_ESTRATEGICA',
-    columns='MES_REFERENCIA',
-    values='VALOR',
-    aggfunc='sum'
-).fillna(0)
 
-# ABA 2: Visão Espelhada Expandida na Sequência Exata Solicitada
-# Estrutura: FRENTE -> STATUS -> GRUPO -> DESCRIÇÃO REASON CODE -> BASE TRIAGEM
-evolucao_resolvido_aberto = df_tracking_critico.pivot_table(
-    index=[
-        'FRENTE_ESTRATEGICA', 
-        'STATUS_RESOLUCAO', 
-        'GRUPO', 
-        'DESCRIÇÃO REASON CODE', 
-        'Base Triagem'
-    ],
-    columns='MES_REFERENCIA',
-    values='VALOR',
-    aggfunc='sum'
-).fillna(0)
+# ==============================================================================
+# 2. TRATAMENTO NUMÉRICO DIRETO (PRESERVANDO DECIMAIS)
+# ==============================================================================
+print("\nIniciando conversão numérica direta preservando decimais originais...")
 
-# ABA 3: Impacto de DSO Consolidado Expandido na mesma Estrutura Hierárquica
-evolucao_dso_pendente = df_tracking_critico.pivot_table(
-    index=[
-        'FRENTE_ESTRATEGICA', 
-        'STATUS_RESOLUCAO', 
-        'GRUPO', 
-        'DESCRIÇÃO REASON CODE', 
-        'Base Triagem'
-    ],
-    columns='MES_REFERENCIA',
-    values='EOM DSO IMPACT',
-    aggfunc='sum'
-).fillna(0)
+if 'VALOR' in df_historico.columns:
+    df_historico['VALOR'] = pd.to_numeric(df_historico['VALOR'], errors='coerce').fillna(0)
+
+dso_cols = ["TODAY'S DSO IMPACT", "EOM DSO IMPACT", "DSO IMPACT FY"]
+for col in dso_cols:
+    if col in df_historico.columns:
+        df_historico[col] = pd.to_numeric(df_historico[col], errors='coerce').fillna(0)
+
+if 'DIAS ATRASO' in df_historico.columns:
+    df_historico['DIAS ATRASO'] = pd.to_numeric(df_historico['DIAS ATRASO'], errors='coerce').fillna(0)
+
+
+# ==============================================================================
+# 3. CLASSIFICAÇÃO DA RESPONSABILIDADE PELA COLUNA 'Text' (AR vs R&R)
+# ==============================================================================
+print("Aplicando classificação de responsabilidade baseada na coluna 'Text'...")
+
+if 'Text' in df_historico.columns:
+    df_historico['Text'] = df_historico['Text'].astype(str).str.strip()
+else:
+    coluna_text_real = [c for c in df_historico.columns if 'text' in c.lower()]
+    if coluna_text_real:
+        df_historico['Text'] = df_historico[coluna_text_real[0]].astype(str).str.strip()
+
+df_historico['FRENTE_ESTRATEGICA'] = np.where(
+    df_historico['Text'].str.startswith('AR', na=False), 
+    'AR', 
+    'R&R'
+)
+
+
+# ==============================================================================
+# 4. FILTRO DE CORTE CRÍTICO: MAIORES DE 120 DIAS
+# ==============================================================================
+print("Filtrando base de dados: Foco exclusivo em faturas com > 120 dias em atraso...")
+df_tracking_critico = df_historico[df_historico['DIAS ATRASO'] > 120].copy()
+
+
+# ==============================================================================
+# 5. LÓGICA DE STATUS: COMPARAÇÃO SEQUENCIAL (MÊS VS MÊS SEGUINTE)
+# ==============================================================================
+print("Analisando o comportamento das combinações de NF e Valor contra o mês seguinte...")
+
+meses_ordenados = sorted(df_tracking_critico['MES_REFERENCIA'].unique())
+mes_mais_recente = meses_ordenados[-1]
+
+df_tracking_critico['CHAVE_NF_VALOR'] = (
+    df_tracking_critico['NF'].astype(str) + '_V_' + df_tracking_critico['VALOR'].round(2).astype(str)
+)
+
+df_processado_lista = []
+
+for i, mes_atual in enumerate(meses_ordenados):
+    df_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_atual].copy()
+    
+    if mes_atual == mes_mais_recente:
+        df_mes['STATUS_RESOLUCAO'] = 'Não Resolvido'
+    else:
+        mes_seguinte = meses_ordenados[i + 1]
+        chaves_mes_seguinte = df_tracking_critico[
+            df_tracking_critico['MES_REFERENCIA'] == mes_seguinte
+        ]['CHAVE_NF_VALOR'].unique()
+        
+        df_mes['STATUS_RESOLUCAO'] = np.where(
+            df_mes['CHAVE_NF_VALOR'].isin(chaves_mes_seguinte),
+            'Não Resolvido',
+            'Resolvido'
+        )
+        
+    df_processado_lista.append(df_mes)
+
+df_tracking_critico = pd.concat(df_processado_lista, ignore_index=True)
+df_tracking_critico = df_tracking_critico.drop(columns=['CHAVE_NF_VALOR'])
+
+
+# ==============================================================================
+# 6. GERANDO A ABA EXCLUSIVA DE LINHAS ÚNICAS (DEDUP SEGURO POR NF)
+# ==============================================================================
+print("Agrupando a base para garantir que cada NF apareça apenas uma vez...")
+
+df_ordenado = df_tracking_critico.sort_values(by=['NF', 'VALOR', 'MES_REFERENCIA'], ascending=[True, True, False])
+df_linhas_unicas = df_ordenado.drop_duplicates(subset=['NF'], keep='first').copy()
+df_linhas_unicas = df_linhas_unicas.rename(columns={'MES_REFERENCIA': 'ULTIMO_MES_VISTO'})
+
+
+# ==============================================================================
+# 7. LÓGICA DE PARETO CONSOLIDADA (BASE EXCLUSIVA DO MÊS CORRENTE)
+# ==============================================================================
+print("Calculando análise de Pareto estritamente para a base do mês recente...")
+
+# Mantém todas as colunas originais de Junho na aba do Pareto
+df_base_pareto_aberta = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente].copy()
+
+df_calculo_pareto = (
+    df_base_pareto_aberta.groupby(['GRUPO', 'REASON CODE'], dropna=False)['VALOR']
+    .sum()
+    .reset_index()
+    .rename(columns={'VALOR': 'Soma_Valor_Grupo_Reason_Atual'})
+)
+
+df_calculo_pareto = df_calculo_pareto.sort_values(by='Soma_Valor_Grupo_Reason_Atual', ascending=False).reset_index(drop=True)
+
+total_junho_pareto = df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'].sum()
+if total_junho_pareto > 0:
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = (df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'] / total_junho_pareto).cumsum()
+else:
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = 0
+
+df_calculo_pareto['Classificacao_Pareto'] = np.where(
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'].shift(1, fill_value=0) < 0.80,
+    'Top 80% (Foco Direto)',
+    'Cauda Longa (Outros 20%)'
+)
+
+df_base_pareto_aberta = pd.merge(
+    df_base_pareto_aberta, 
+    df_calculo_pareto, 
+    on=['GRUPO', 'REASON CODE'], 
+    how='left'
+)
+
+df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'] = df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'].fillna(0)
+df_base_pareto_aberta['%_Acumulada_Grupo_Reason'] = df_base_pareto_aberta['%_Acumulada_Grupo_Reason'].fillna(1.0)
+df_base_pareto_aberta['Classificacao_Pareto'] = df_base_pareto_aberta['Classificacao_Pareto'].fillna('Cauda Longa (Outros 20%)')
+
+df_base_pareto_aberta = df_base_pareto_aberta.sort_values(by=['Soma_Valor_Grupo_Reason_Atual', 'VALOR'], ascending=[False, False])
+
+
+# ==============================================================================
+# 8. GERAÇÃO DAS MATRIZES DE TENDÊNCIA E EVOLUÇÃO MENSAL
+# ==============================================================================
