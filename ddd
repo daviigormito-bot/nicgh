@@ -1,0 +1,102 @@
+# ==============================================================================
+# # 2. TRATAMENTO DE VALORES E FORMATOS (DATA CLEANING)
+# ==============================================================================
+print("\nIniciando o tratamento dos dados...")
+
+# Padronizar a coluna VALOR para garantir que seja numérica
+if 'VALOR' in df_historico.columns:
+    df_historico['VALOR'] = pd.to_numeric(
+        df_historico['VALOR'].astype(str)
+        .str.replace('.', '', regex=False)
+        .str.replace(',', '.', regex=False), 
+        errors='coerce'
+    ).fillna(0)
+
+# Padronizar as colunas oficiais de impacto no DSO
+dso_cols = ["TODAY'S DSO IMPACT", "EOM DSO IMPACT", "DSO IMPACT FY"]
+for col in dso_cols:
+    if col in df_historico.columns:
+        df_historico[col] = pd.to_numeric(
+            df_historico[col].astype(str)
+            .str.replace('.', '', regex=False)
+            .str.replace(',', '.', regex=False), 
+            errors='coerce'
+        ).fillna(0)
+
+# Garantir que a coluna DIAS AT seja numérica
+if 'DIAS AT' in df_historico.columns:
+    df_historico['DIAS AT'] = pd.to_numeric(df_historico['DIAS AT'], errors='coerce').fillna(0)
+
+
+# ==============================================================================
+# # 3. ÁRVORE DE DECISÃO: MAPEAMENTO DA COLUNA 'Base Triagem'
+# ==============================================================================
+print("Aplicando regras de negócio e mapeamento de responsabilidades...")
+
+# Condições baseadas estritamente nos status oficiais da sua coluna 'Base Triagem'
+conditions = [
+    df_historico['Base Triagem'].isin([
+        'AR - ENVIAR CANHOTO DA NFD - TRANSPORTADORA DESCONHECE', 
+        'R&R - AGUARDANDO RETORNO DA TRANSPORTADORA', 
+        'TRANSPORTADORA CORRIGIR MANIFESTAÇÃO'
+    ]),
+    df_historico['Base Triagem'].isin(['AR - COBRAR CANHOTO DO CLIENTE']),
+    df_historico['Base Triagem'].isin(['R&R - COBRAR MANIFESTAÇÃO', 'R&R - COBRAR MANIFESTAÇÃO - CANHOTO ENVIADO']),
+    df_historico['Base Triagem'].isin(['CO - ENCERRAR MANIFESTAÇÃO', 'R&R - PROCESSAR', 'AR - CTLM - VALIDAR INFORMAÇÃO']),
+    df_historico['Base Triagem'] == 'PROCESSO FINALIZADO'
+]
+
+# Definição das áreas responsáveis e ações correspondentes
+owners = ['LOGÍSTICA / TRANSPORTES', 'COBRANÇA / PORTAL', 'TIME DE VENDAS', 'FINANCEIRO INTERNO', 'CONCLUÍDO']
+actions = [
+    'Cobrar resposta ou correção operacional de canhoto com o transportador',
+    'Exigir comprovante físico de devolução direto com o cliente corporativo',
+    'Solicitar abertura ou regularização sistêmica da manifestação comercial',
+    'Acompanhar SLA interno de auditoria, validação CTLM ou processamento SAP',
+    'Disputa encerrada - Baixa efetuada'
+]
+
+# Criação das novas colunas estratégicas no DataFrame
+df_historico['RESPONSÁVEL_TRATATIVA'] = np.select(conditions, owners, default='PENDENTE TRIAGEM')
+df_historico['PLANO_DE_AÇÃO'] = np.select(conditions, actions, default='Revisar entrada na Base Triagem')
+
+
+# ==============================================================================
+# # 4. PROCESSAMENTO DAS MATRIZES DE EVOLUÇÃO (BI / TENDÊNCIAS)
+# ==============================================================================
+print("Cruzando dados para análise de evolução mensal...")
+
+# Matriz 1: Evolução do Saldo Financeiro Absoluto Travado por Área (VALOR)
+evolucao_valor = df_historico.pivot_table(
+    index='RESPONSÁVEL_TRATATIVA',
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+# Matriz 2: Evolução do Impacto Real no DSO de Fechamento de Mês (EOM DSO IMPACT)
+evolucao_dso = df_historico.pivot_table(
+    index='RESPONSÁVEL_TRATATIVA',
+    columns='MES_REFERENCIA',
+    values='EOM DSO IMPACT',
+    aggfunc='sum'
+).fillna(0)
+
+
+# ==============================================================================
+# # 5. EXPORTAÇÃO COMPLETA PARA UM ÚNICO EXCEL COM ABAS SEPARADAS
+# ==============================================================================
+output_file = os.path.join(path, 'RELATORIO_ESTRATEGICO_RETORNO.xlsx')
+print(f"Exportando resultados para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    # Aba 1: A base inteira tratada e tagueada para você filtrar como quiser
+    df_historico.to_excel(writer, sheet_name='Base_Historica_Tratada', index=False)
+    
+    # Aba 2: Resumo financeiro do saldo retido por área mês a mês
+    evolucao_valor.to_excel(writer, sheet_name='Evolucao_Saldo_Financeiro')
+    
+    # Aba 3: Onde o calo aperta -> Evolução do impacto no DSO por área mês a mês
+    evolucao_dso.to_excel(writer, sheet_name='Evolucao_Impacto_DSO')
+
+print("\n🚀 Processo concluído com sucesso! Relatório pronto para análise.")
