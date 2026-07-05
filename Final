@@ -1,0 +1,543 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+
+# ==============================================================================
+# 1. MAPEAMENTO DE DIRETÓRIOS E IMPORTAÇÃO TOTAL DE COLUNAS
+# ==============================================================================
+path = r'C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\projetoretorno'
+
+all_files = glob.glob(os.path.join(path, "base_*.xlsx"))
+all_files.sort()
+
+li = []
+print("--- Iniciando Importação de 100% das Colunas das Bases ---")
+
+for filename in all_files:
+    nome_arquivo = os.path.basename(filename)
+    codigo_mes = nome_arquivo.split("_")[-1].replace(".xlsx", "")
+    ano_mes_formatado = f"{codigo_mes[:4]}-{codigo_mes[4:]}"
+
+    try:
+        temp_df = pd.read_excel(filename, sheet_name=0)
+        temp_df.columns = temp_df.columns.str.strip()
+
+        coluna_triagem_real = [c for c in temp_df.columns if 'triagem' in c.lower()]
+        if coluna_triagem_real:
+            temp_df = temp_df.rename(columns={coluna_triagem_real[0]: 'Base Triagem'})
+
+        temp_df['MES_REFERENCIA'] = ano_mes_formatado
+        li.append(temp_df)
+        print(f"OK Sucesso Integral: {nome_arquivo} -> Competencia: {ano_mes_formatado}")
+
+    except Exception as e:
+        print(f"ERRO critico ao ler o arquivo {nome_arquivo}: {e}")
+
+if li:
+    df_historico = pd.concat(li, axis=0, ignore_index=True)
+    print(f"\n-> Consolidacao concluida! Linhas totais: {len(df_historico)} | Colunas totais: {len(df_historico.columns)}")
+else:
+    print("Erro: Nenhum arquivo foi carregado. Verifique os caminhos.")
+    exit()
+
+
+# ==============================================================================
+# 2. TRATAMENTO NUMERICO DIRETO (PRESERVANDO DECIMAIS)
+# ==============================================================================
+print("\nIniciando conversao numerica direta preservando decimais originais...")
+
+if 'VALOR' in df_historico.columns:
+    df_historico['VALOR'] = pd.to_numeric(df_historico['VALOR'], errors='coerce').fillna(0)
+
+dso_cols = ["TODAY'S DSO IMPACT", "EOM DSO IMPACT", "DSO IMPACT FY"]
+for col in dso_cols:
+    if col in df_historico.columns:
+        df_historico[col] = pd.to_numeric(df_historico[col], errors='coerce').fillna(0)
+
+if 'DIAS ATRASO' in df_historico.columns:
+    df_historico['DIAS ATRASO'] = pd.to_numeric(df_historico['DIAS ATRASO'], errors='coerce').fillna(0)
+
+
+# ==============================================================================
+# 3. CLASSIFICACAO DA RESPONSABILIDADE PELA COLUNA 'Text' (AR vs R&R)
+# ==============================================================================
+print("Aplicando classificacao de responsabilidade baseada na coluna 'Text'...")
+
+if 'Text' in df_historico.columns:
+    df_historico['Text'] = df_historico['Text'].astype(str).str.strip()
+else:
+    coluna_text_real = [c for c in df_historico.columns if 'text' in c.lower()]
+    if coluna_text_real:
+        df_historico['Text'] = df_historico[coluna_text_real[0]].astype(str).str.strip()
+
+df_historico['FRENTE_ESTRATEGICA'] = np.where(
+    df_historico['Text'].str.startswith('AR', na=False),
+    'AR',
+    'R&R'
+)
+
+
+# ==============================================================================
+# 4. FILTRO DE CORTE CRITICO: MAIORES DE 120 DIAS
+# ==============================================================================
+print("Filtrando base de dados: Foco exclusivo em faturas com > 120 dias em atraso...")
+df_tracking_critico = df_historico[df_historico['DIAS ATRASO'] > 120].copy()
+
+# Garante coluna de triagem presente desde o inicio (usada em varios cortes)
+if 'Base Triagem' not in df_tracking_critico.columns:
+    df_tracking_critico['Base Triagem'] = 'Nao Triado'
+else:
+    df_tracking_critico['Base Triagem'] = df_tracking_critico['Base Triagem'].fillna('Nao Triado')
+
+
+# ==============================================================================
+# 5. LOGICA DE STATUS: RESOLUCAO POR CHAVE COMPOSTA (NF + GRUPO + VALOR)
+#    - Resolvido / Nao Resolvido (sem parcial)
+# ==============================================================================
+print("Analisando resolucao por chave composta (NF + Grupo + Valor) contra o mes seguinte...")
+
+meses_ordenados = sorted(df_tracking_critico['MES_REFERENCIA'].unique())
+mes_mais_recente = meses_ordenados[-1]
+
+df_tracking_critico['CHAVE_RESOLUCAO'] = (
+    df_tracking_critico['NF'].astype(str) + '_' +
+    df_tracking_critico['GRUPO'].astype(str) + '_' +
+    df_tracking_critico['VALOR'].round(2).astype(str)
+)
+
+df_processado_lista = []
+
+for i, mes_atual in enumerate(meses_ordenados):
+    df_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_atual].copy()
+
+    if mes_atual == mes_mais_recente:
+        df_mes['STATUS_RESOLUCAO'] = 'Nao Resolvido'
+    else:
+        mes_seguinte = meses_ordenados[i + 1]
+        chaves_mes_seguinte = df_tracking_critico[
+            df_tracking_critico['MES_REFERENCIA'] == mes_seguinte
+        ]['CHAVE_RESOLUCAO'].unique()
+
+        df_mes['STATUS_RESOLUCAO'] = np.where(
+            df_mes['CHAVE_RESOLUCAO'].isin(chaves_mes_seguinte),
+            'Nao Resolvido',
+            'Resolvido'
+        )
+
+    df_processado_lista.append(df_mes)
+
+df_tracking_critico = pd.concat(df_processado_lista, ignore_index=True)
+
+
+# ==============================================================================
+# 5.1. IDADE TRAVADA: MESES CONSECUTIVOS COMO CRITICO (POR CHAVE COMPOSTA)
+#    Mede ha quanto tempo o mesmo caso esta parado na faixa >120 dias.
+# ==============================================================================
+print("Calculando meses consecutivos que cada caso permanece critico...")
+
+df_tracking_critico = df_tracking_critico.sort_values(['CHAVE_RESOLUCAO', 'MES_REFERENCIA'])
+df_tracking_critico['MESES_CONSECUTIVOS_CRITICO'] = (
+    df_tracking_critico.groupby('CHAVE_RESOLUCAO').cumcount() + 1
+)
+
+
+# ==============================================================================
+# 5.2. AGING REFINADO DENTRO DO CRITICO (FAIXAS ALEM DOS 120 DIAS)
+# ==============================================================================
+print("Classificando faixas de aging dentro do balde critico...")
+
+df_tracking_critico['FAIXA_CRITICA'] = pd.cut(
+    df_tracking_critico['DIAS ATRASO'],
+    bins=[120, 180, 270, 365, np.inf],
+    labels=['121-180', '181-270', '271-365', '365+']
+)
+
+
+# ==============================================================================
+# 6. AUDITORIA DE DUPLICIDADE + PAINEL CONSOLIDADO UNICO (DEDUP SEGURO)
+# ==============================================================================
+print("Auditando duplicidades e gerando painel consolidado unico...")
+
+# Auditoria: mesma NF com mais de uma linha no mesmo mes (possivel parcial)
+mascara_dup = df_tracking_critico.duplicated(subset=['NF', 'MES_REFERENCIA'], keep=False)
+df_auditoria_dup = df_tracking_critico[mascara_dup].sort_values(['NF', 'MES_REFERENCIA']).copy()
+print(f"-> Linhas com NF repetida no mesmo mes (para conferencia): {len(df_auditoria_dup)}")
+
+# Dedup preservando o registro mais recente de cada chave composta
+df_ordenado = df_tracking_critico.sort_values(
+    by=['CHAVE_RESOLUCAO', 'MES_REFERENCIA'], ascending=[True, False]
+)
+df_linhas_unicas = df_ordenado.drop_duplicates(subset=['CHAVE_RESOLUCAO'], keep='first').copy()
+df_linhas_unicas = df_linhas_unicas.rename(columns={'MES_REFERENCIA': 'ULTIMO_MES_VISTO'})
+
+
+# ==============================================================================
+# 7. PARETO NIVEL 1: GRUPO x DESCRICAO REASON CODE (BASE DO MES CORRENTE)
+# ==============================================================================
+print("Calculando Pareto de Grupo x Reason estritamente para a base do mes recente...")
+
+df_base_pareto_aberta = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente].copy()
+
+df_calculo_pareto = (
+    df_base_pareto_aberta.groupby(['GRUPO', 'REASON CODE'], dropna=False)['VALOR']
+    .sum()
+    .reset_index()
+    .rename(columns={'VALOR': 'Soma_Valor_Grupo_Reason_Atual'})
+)
+
+df_calculo_pareto = df_calculo_pareto.sort_values(
+    by='Soma_Valor_Grupo_Reason_Atual', ascending=False
+).reset_index(drop=True)
+
+total_pareto = df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'].sum()
+if total_pareto > 0:
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = (
+        df_calculo_pareto['Soma_Valor_Grupo_Reason_Atual'] / total_pareto
+    ).cumsum()
+else:
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'] = 0
+
+df_calculo_pareto['Classificacao_Pareto'] = np.where(
+    df_calculo_pareto['%_Acumulada_Grupo_Reason'].shift(1, fill_value=0) < 0.80,
+    'Top 80% (Foco Direto)',
+    'Cauda Longa (Outros 20%)'
+)
+
+df_base_pareto_aberta = pd.merge(
+    df_base_pareto_aberta,
+    df_calculo_pareto,
+    on=['GRUPO', 'REASON CODE'],
+    how='left'
+)
+
+df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'] = df_base_pareto_aberta['Soma_Valor_Grupo_Reason_Atual'].fillna(0)
+df_base_pareto_aberta['%_Acumulada_Grupo_Reason'] = df_base_pareto_aberta['%_Acumulada_Grupo_Reason'].fillna(1.0)
+df_base_pareto_aberta['Classificacao_Pareto'] = df_base_pareto_aberta['Classificacao_Pareto'].fillna('Cauda Longa (Outros 20%)')
+
+df_base_pareto_aberta = df_base_pareto_aberta.sort_values(
+    by=['Soma_Valor_Grupo_Reason_Atual', 'VALOR'], ascending=[False, False]
+)
+
+
+# ==============================================================================
+# 7.1. PARETO NIVEL 2: NF INDIVIDUAL DENTRO DO FOCO (O QUE PERGUNTAR AO ANALISTA)
+#    Cortes por GRUPO, DESCRICAO REASON CODE e Base Triagem.
+# ==============================================================================
+print("Filtrando NFs individuais que explicam a maioria do valor dentro do foco...")
+
+df_foco = df_base_pareto_aberta[
+    df_base_pareto_aberta['Classificacao_Pareto'] == 'Top 80% (Foco Direto)'
+].copy()
+
+df_nf_foco = (
+    df_foco.groupby(['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem', 'NF'], dropna=False)['VALOR']
+    .sum()
+    .reset_index()
+    .rename(columns={'VALOR': 'Valor_NF'})
+)
+
+df_nf_foco['abs_valor'] = df_nf_foco['Valor_NF'].abs()
+df_nf_foco = df_nf_foco.sort_values(by='abs_valor', ascending=False).reset_index(drop=True)
+
+total_foco = df_nf_foco['abs_valor'].sum()
+if total_foco > 0:
+    df_nf_foco['%_Acumulada_NF'] = (df_nf_foco['abs_valor'] / total_foco).cumsum()
+else:
+    df_nf_foco['%_Acumulada_NF'] = 0
+
+df_nf_foco['Perguntar_Analista'] = np.where(
+    df_nf_foco['%_Acumulada_NF'].shift(1, fill_value=0) < 0.80,
+    'SIM - Prioritaria',
+    'Nao (cauda)'
+)
+
+df_nf_foco = df_nf_foco.drop(columns=['abs_valor'])
+
+# Mescla a classificacao de volta na base ABERTA (todas as colunas originais),
+# para permitir pivot table e dar visao completa das notas ao analista
+df_pareto_nf_completo = pd.merge(
+    df_foco,
+    df_nf_foco[['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem', 'NF',
+                'Valor_NF', '%_Acumulada_NF', 'Perguntar_Analista']],
+    on=['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem', 'NF'],
+    how='left'
+)
+df_pareto_nf_completo['Perguntar_Analista'] = df_pareto_nf_completo['Perguntar_Analista'].fillna('Nao (cauda)')
+df_pareto_nf_completo = df_pareto_nf_completo.sort_values(
+    by=['%_Acumulada_NF', 'VALOR'], ascending=[True, False]
+)
+
+df_perguntar = df_pareto_nf_completo[
+    df_pareto_nf_completo['Perguntar_Analista'] == 'SIM - Prioritaria'
+].copy()
+print(f"-> De {df_nf_foco['NF'].nunique()} NFs no foco, apenas {df_perguntar['NF'].nunique()} explicam 80% do valor.")
+
+
+# ==============================================================================
+# 8. MATRIZES DE TENDENCIA E EVOLUCAO MENSAL
+#    Cortes por GRUPO, DESCRICAO REASON CODE e Base Triagem (sem frente).
+# ==============================================================================
+print("Gerando tabelas dinamicas por Grupo, Reason e Triagem...")
+
+evolucao_saldo = df_tracking_critico.pivot_table(
+    index=['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem'],
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+evolucao_resolvido_aberto = df_tracking_critico.pivot_table(
+    index=['STATUS_RESOLUCAO', 'GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem'],
+    columns='MES_REFERENCIA',
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+evolucao_dso_pendente = df_tracking_critico.pivot_table(
+    index=['STATUS_RESOLUCAO', 'GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem'],
+    columns='MES_REFERENCIA',
+    values='EOM DSO IMPACT',
+    aggfunc='sum'
+).fillna(0)
+
+
+# ==============================================================================
+# 8.1. TAXA DE RESOLUCAO MES A MES (POR GRUPO, REASON, TRIAGEM)
+# ==============================================================================
+print("Calculando taxa de resolucao mes a mes...")
+
+taxa_resolucao = df_tracking_critico[
+    df_tracking_critico['MES_REFERENCIA'] != mes_mais_recente
+].pivot_table(
+    index=['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem'],
+    columns=['MES_REFERENCIA', 'STATUS_RESOLUCAO'],
+    values='VALOR',
+    aggfunc='sum'
+).fillna(0)
+
+
+# ==============================================================================
+# 8.2. RESUMO EXECUTIVO CONSOLIDADO (PULSO DA CARTEIRA EM UMA ABA)
+# ==============================================================================
+print("Montando resumo executivo consolidado...")
+
+df_atual = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente]
+
+resumo_executivo = df_atual.groupby(
+    ['GRUPO', 'DESCRIÇÃO REASON CODE', 'Base Triagem'], dropna=False
+).agg(
+    Saldo_Atual=('VALOR', 'sum'),
+    Qtd_NFs=('NF', 'nunique'),
+    Impacto_DSO=('EOM DSO IMPACT', 'sum'),
+    Meses_Travado_Max=('MESES_CONSECUTIVOS_CRITICO', 'max'),
+    Meses_Travado_Medio=('MESES_CONSECUTIVOS_CRITICO', 'mean')
+).reset_index()
+
+# Sinalizador de caso estrutural: parado ha 3+ meses consecutivos
+resumo_executivo['Alerta_Estrutural'] = np.where(
+    resumo_executivo['Meses_Travado_Max'] >= 3, 'CASO ESTRUTURAL (3+ meses)', 'Recente'
+)
+
+resumo_executivo = resumo_executivo.sort_values(by='Saldo_Atual', ascending=False)
+
+
+# ==============================================================================
+# 8.3. SCORE DE PRIORIZACAO DE ATAQUE (VALOR x TEMPO TRAVADO x DSO)
+#    Ranking unico de quais casos limpar primeiro no mes corrente.
+# ==============================================================================
+print("Calculando score de priorizacao dos casos pendentes do mes corrente...")
+
+df_pendentes = df_tracking_critico[
+    df_tracking_critico['MES_REFERENCIA'] == mes_mais_recente
+].copy()
+
+# Normalizacao 0-1 de cada dimensao (protegido contra divisao por zero)
+def normalizar(serie):
+    faixa = serie.max() - serie.min()
+    if faixa == 0:
+        return pd.Series(0, index=serie.index)
+    return (serie - serie.min()) / faixa
+
+df_pendentes['_n_valor'] = normalizar(df_pendentes['VALOR'].abs())
+df_pendentes['_n_meses'] = normalizar(df_pendentes['MESES_CONSECUTIVOS_CRITICO'])
+if 'EOM DSO IMPACT' in df_pendentes.columns:
+    df_pendentes['_n_dso'] = normalizar(df_pendentes['EOM DSO IMPACT'].abs())
+else:
+    df_pendentes['_n_dso'] = 0
+
+# Pesos: valor pesa mais, tempo travado em seguida, DSO complementa
+df_pendentes['SCORE_PRIORIDADE'] = (
+    df_pendentes['_n_valor'] * 0.50 +
+    df_pendentes['_n_meses'] * 0.30 +
+    df_pendentes['_n_dso'] * 0.20
+).round(4)
+
+df_pendentes = df_pendentes.drop(columns=['_n_valor', '_n_meses', '_n_dso'])
+df_pendentes = df_pendentes.sort_values(by='SCORE_PRIORIDADE', ascending=False)
+df_pendentes['RANKING_ATAQUE'] = range(1, len(df_pendentes) + 1)
+
+
+# ==============================================================================
+# 8.4. PLANO DE ACAO VIVO COM MEMORIA ENTRE MESES
+#    Gera aba pronta para circular (dono, status, prazo, comentario).
+#    Se existir PLANO_ACAO_RETORNO.xlsx na pasta, reimporta as tratativas
+#    do ciclo anterior e casa pela CHAVE_RESOLUCAO para nao perder historico.
+# ==============================================================================
+print("Montando plano de acao com memoria de follow-up...")
+
+colunas_plano = [
+    'RANKING_ATAQUE', 'SCORE_PRIORIDADE', 'CHAVE_RESOLUCAO', 'NF', 'GRUPO',
+    'DESCRIÇÃO REASON CODE', 'Base Triagem', 'VALOR', 'DIAS ATRASO',
+    'FAIXA_CRITICA', 'MESES_CONSECUTIVOS_CRITICO'
+]
+colunas_plano = [c for c in colunas_plano if c in df_pendentes.columns]
+df_plano_acao = df_pendentes[colunas_plano].copy()
+
+# Colunas de gestao do processo (a preencher pelo time)
+df_plano_acao['DONO_TRATATIVA'] = ''
+df_plano_acao['STATUS_TRATATIVA'] = 'Nao Iniciado'
+df_plano_acao['ACAO_PROPOSTA'] = ''
+df_plano_acao['PRAZO'] = ''
+df_plano_acao['COMENTARIO_ANALISTA'] = ''
+df_plano_acao['DATA_ULTIMA_ATUALIZACAO'] = ''
+
+# Reimportacao do retorno do ciclo anterior (se existir)
+arquivo_retorno = os.path.join(path, 'PLANO_ACAO_RETORNO.xlsx')
+if os.path.exists(arquivo_retorno):
+    try:
+        df_retorno = pd.read_excel(arquivo_retorno)
+        df_retorno.columns = df_retorno.columns.str.strip()
+        cols_followup = [
+            'DONO_TRATATIVA', 'STATUS_TRATATIVA', 'ACAO_PROPOSTA',
+            'PRAZO', 'COMENTARIO_ANALISTA', 'DATA_ULTIMA_ATUALIZACAO'
+        ]
+        cols_presentes = [c for c in cols_followup if c in df_retorno.columns]
+        # Blindagem: garante tipo texto nas colunas de follow-up (Excel pode reler vazios como numerico)
+        for c in cols_presentes:
+            df_retorno[c] = df_retorno[c].astype(object).where(df_retorno[c].notna(), '')
+            df_retorno[c] = df_retorno[c].astype(str).replace('nan', '')
+        if 'CHAVE_RESOLUCAO' in df_retorno.columns and cols_presentes:
+            df_retorno_dedup = df_retorno.drop_duplicates(
+                subset=['CHAVE_RESOLUCAO'], keep='last'
+            )[['CHAVE_RESOLUCAO'] + cols_presentes]
+
+            df_plano_acao = df_plano_acao.drop(columns=cols_presentes)
+            df_plano_acao = pd.merge(
+                df_plano_acao, df_retorno_dedup,
+                on='CHAVE_RESOLUCAO', how='left'
+            )
+            for c in cols_followup:
+                if c not in df_plano_acao.columns:
+                    df_plano_acao[c] = ''
+            df_plano_acao['STATUS_TRATATIVA'] = df_plano_acao['STATUS_TRATATIVA'].fillna('Nao Iniciado')
+            for c in ['DONO_TRATATIVA', 'ACAO_PROPOSTA', 'PRAZO', 'COMENTARIO_ANALISTA', 'DATA_ULTIMA_ATUALIZACAO']:
+                df_plano_acao[c] = df_plano_acao[c].fillna('')
+            casados = (df_plano_acao['STATUS_TRATATIVA'] != 'Nao Iniciado').sum()
+            print(f"-> Follow-up reimportado: {casados} casos com tratativa em andamento preservada.")
+        else:
+            print("-> Retorno encontrado, mas sem CHAVE_RESOLUCAO ou colunas de follow-up. Plano gerado limpo.")
+    except Exception as e:
+        print(f"-> Nao foi possivel reimportar o retorno ({e}). Plano gerado limpo.")
+else:
+    print("-> Nenhum PLANO_ACAO_RETORNO.xlsx encontrado. Plano gerado limpo (primeiro ciclo).")
+
+df_plano_acao = df_plano_acao.sort_values(by='RANKING_ATAQUE')
+
+# Casos ja tratados que sairam da base (resolvidos apos tratativa) - fechamento do ciclo
+if os.path.exists(arquivo_retorno):
+    try:
+        chaves_atuais = set(df_plano_acao['CHAVE_RESOLUCAO'])
+        df_fechados = df_retorno[~df_retorno['CHAVE_RESOLUCAO'].isin(chaves_atuais)].copy()
+        if len(df_fechados) > 0:
+            df_fechados['RESULTADO_CICLO'] = 'Saiu da base critica (resolvido/baixado)'
+            print(f"-> {len(df_fechados)} casos do ciclo anterior sairam da base critica.")
+        else:
+            df_fechados = pd.DataFrame()
+    except Exception:
+        df_fechados = pd.DataFrame()
+else:
+    df_fechados = pd.DataFrame()
+
+
+# ==============================================================================
+# 8.5. FLUXO DO BACKLOG: ENTRADAS vs SAIDAS MES A MES
+#    Mostra se a limpeza esta ganhando do volume que entra.
+# ==============================================================================
+print("Calculando fluxo do backlog (entradas vs saidas)...")
+
+fluxo_lista = []
+chaves_por_mes = {
+    m: set(df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == m]['CHAVE_RESOLUCAO'])
+    for m in meses_ordenados
+}
+valor_por_chave_mes = df_tracking_critico.groupby(['MES_REFERENCIA', 'CHAVE_RESOLUCAO'])['VALOR'].sum()
+
+for i, mes in enumerate(meses_ordenados):
+    chaves_mes = chaves_por_mes[mes]
+    if i == 0:
+        entradas = chaves_mes
+        saidas = set()
+    else:
+        mes_anterior = meses_ordenados[i - 1]
+        entradas = chaves_mes - chaves_por_mes[mes_anterior]
+        saidas = chaves_por_mes[mes_anterior] - chaves_mes
+
+    valor_entradas = sum(valor_por_chave_mes.get((mes, c), 0) for c in entradas)
+    valor_saidas = sum(valor_por_chave_mes.get((meses_ordenados[i - 1], c), 0) for c in saidas) if i > 0 else 0
+    saldo_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes]['VALOR'].sum()
+
+    fluxo_lista.append({
+        'MES_REFERENCIA': mes,
+        'Qtd_Casos_Novos': len(entradas),
+        'Valor_Casos_Novos': valor_entradas,
+        'Qtd_Casos_Resolvidos': len(saidas),
+        'Valor_Casos_Resolvidos': valor_saidas,
+        'Saldo_Fluxo_Valor': valor_saidas - valor_entradas,
+        'Saldo_Total_Critico': saldo_mes
+    })
+
+df_fluxo_backlog = pd.DataFrame(fluxo_lista)
+
+
+# ==============================================================================
+# 8.6. DISTRIBUICAO DE CARGA POR TRIAGEM (PARA DIVIDIR O TRABALHO)
+# ==============================================================================
+print("Gerando distribuicao de carga por base de triagem...")
+
+df_carga_triagem = df_pendentes.groupby(
+    ['Base Triagem', 'GRUPO', 'DESCRIÇÃO REASON CODE'], dropna=False
+).agg(
+    Qtd_NFs=('NF', 'nunique'),
+    Valor_Total=('VALOR', 'sum'),
+    Meses_Travado_Max=('MESES_CONSECUTIVOS_CRITICO', 'max'),
+    Score_Medio=('SCORE_PRIORIDADE', 'mean')
+).reset_index().sort_values(by='Valor_Total', ascending=False)
+
+
+# ==============================================================================
+# 9. EXPORTACAO FINAL
+# ==============================================================================
+output_file = os.path.join(path, 'TRACKING_CRITICO_AR_RR.xlsx')
+print(f"Exportando resultados consolidados para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    resumo_executivo.to_excel(writer, sheet_name='Resumo_Executivo', index=False)
+    df_plano_acao.to_excel(writer, sheet_name='Plano_Acao', index=False)
+    df_fluxo_backlog.to_excel(writer, sheet_name='Fluxo_Backlog', index=False)
+    df_carga_triagem.to_excel(writer, sheet_name='Carga_por_Triagem', index=False)
+    if len(df_fechados) > 0:
+        df_fechados.to_excel(writer, sheet_name='Casos_Fechados_Ciclo', index=False)
+    df_perguntar.to_excel(writer, sheet_name='Perguntar_Analista', index=False)
+    df_pareto_nf_completo.to_excel(writer, sheet_name='Pareto_NF_Individual', index=False)
+    df_base_pareto_aberta.to_excel(writer, sheet_name='Pareto_80_20', index=False)
+    df_linhas_unicas.to_excel(writer, sheet_name='Painel_Consolidado_Unico', index=False)
+    df_tracking_critico.to_excel(writer, sheet_name='Historico_Completo_Mes_a_Mes', index=False)
+    taxa_resolucao.to_excel(writer, sheet_name='Taxa_Resolucao_Mensal')
+    evolucao_saldo.to_excel(writer, sheet_name='Evolucao_Saldo_Critico')
+    evolucao_resolvido_aberto.to_excel(writer, sheet_name='Evolucao_Resolvido_vs_Aberto')
+    evolucao_dso_pendente.to_excel(writer, sheet_name='Evolucao_Impacto_DSO_Critico')
+    if len(df_auditoria_dup) > 0:
+        df_auditoria_dup.to_excel(writer, sheet_name='Auditoria_Duplicidade', index=False)
+
+print("\n[CONCLUIDO] Script executado com sucesso e todas as colunas preservadas.")
