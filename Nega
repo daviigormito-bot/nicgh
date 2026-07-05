@@ -1,0 +1,56 @@
+saldo_mes = df_tracking_critico[df_tracking_critico['MES_REFERENCIA'] == mes]['VALOR'].sum()
+
+    fluxo_lista.append({
+        'MES_REFERENCIA': mes,
+        'Qtd_Casos_Novos': len(entradas),
+        'Valor_Casos_Novos': valor_entradas,
+        'Qtd_Casos_Resolvidos': len(saidas),
+        'Valor_Casos_Resolvidos': valor_saidas,
+        'Saldo_Fluxo_Valor': valor_saidas - valor_entradas,
+        'Saldo_Total_Critico': saldo_mes
+    })
+
+df_fluxo_backlog = pd.DataFrame(fluxo_lista)
+
+
+# ==============================================================================
+# 8.6. DISTRIBUICAO DE CARGA POR TRIAGEM (PARA DIVIDIR O TRABALHO)
+# ==============================================================================
+print("Gerando distribuicao de carga por base de triagem...")
+
+df_carga_triagem = df_pendentes.groupby(
+    ['Base Triagem', 'GRUPO', 'DESCRIÇÃO REASON CODE'], dropna=False
+).agg(
+    Qtd_NFs=('NF', 'nunique'),
+    Valor_Total=('VALOR', 'sum'),
+    Meses_Travado_Max=('MESES_CONSECUTIVOS_CRITICO', 'max'),
+    Score_Medio=('SCORE_PRIORIDADE', 'mean')
+).reset_index().sort_values(by='Valor_Total', ascending=False)
+
+
+# ==============================================================================
+# 9. EXPORTACAO FINAL
+# ==============================================================================
+output_file = os.path.join(path, 'TRACKING_CRITICO_AR_RR.xlsx')
+print(f"Exportando resultados consolidados para: {output_file}")
+
+with pd.ExcelWriter(output_file) as writer:
+    resumo_executivo.to_excel(writer, sheet_name='Resumo_Executivo', index=False)
+    df_plano_acao.to_excel(writer, sheet_name='Plano_Acao', index=False)
+    df_fluxo_backlog.to_excel(writer, sheet_name='Fluxo_Backlog', index=False)
+    df_carga_triagem.to_excel(writer, sheet_name='Carga_por_Triagem', index=False)
+    if len(df_fechados) > 0:
+        df_fechados.to_excel(writer, sheet_name='Casos_Fechados_Ciclo', index=False)
+    df_perguntar.to_excel(writer, sheet_name='Perguntar_Analista', index=False)
+    df_nf_foco.to_excel(writer, sheet_name='Pareto_NF_Individual', index=False)
+    df_base_pareto_aberta.to_excel(writer, sheet_name='Pareto_80_20', index=False)
+    df_linhas_unicas.to_excel(writer, sheet_name='Painel_Consolidado_Unico', index=False)
+    df_tracking_critico.to_excel(writer, sheet_name='Historico_Completo_Mes_a_Mes', index=False)
+    taxa_resolucao.to_excel(writer, sheet_name='Taxa_Resolucao_Mensal')
+    evolucao_saldo.to_excel(writer, sheet_name='Evolucao_Saldo_Critico')
+    evolucao_resolvido_aberto.to_excel(writer, sheet_name='Evolucao_Resolvido_vs_Aberto')
+    evolucao_dso_pendente.to_excel(writer, sheet_name='Evolucao_Impacto_DSO_Critico')
+    if len(df_auditoria_dup) > 0:
+        df_auditoria_dup.to_excel(writer, sheet_name='Auditoria_Duplicidade', index=False)
+
+print("\n[CONCLUIDO] Script executado com sucesso
