@@ -1,0 +1,112 @@
+# -*- coding: utf-8 -*-
+"""
+Diagnostico de notas reprovadas.
+
+Objetivo: entender por que notas com valor igual e vencimento proximo estao
+sendo classificadas como "Nao Apta". Mostra, para cada nota informada, os
+valores brutos e convertidos das duas bases lado a lado.
+
+Como usar:
+    1. Ajuste os tres caminhos abaixo.
+    2. Coloque em NOTAS_INVESTIGAR alguns numeros de nota que deveriam ser
+       aptos (pode ser o numero puro do fornecedor, ex: 1807789).
+    3. Rode: python diagnostico_notas.py
+"""
+
+import reconciliacao_antecipacao as r
+import pandas as pd
+
+# -------------------------------------------------------------------
+# AJUSTE AQUI
+# -------------------------------------------------------------------
+CAMINHO_FORNECEDOR = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\07.07_ - P&G.xlsx"
+CAMINHO_INTERNA = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\RAIASIL20260707060113.XLS"
+
+# Numeros de nota (puros, como no fornecedor) que deveriam sair como aptos
+NOTAS_INVESTIGAR = ["1807789", "1807791", "1807792", "1807794"]
+# -------------------------------------------------------------------
+
+
+def principal():
+    df_forn = r.ler_base_fornecedor(CAMINHO_FORNECEDOR)
+    df_int = r.ler_base_interna(CAMINHO_INTERNA)
+
+    # Identifica colunas nas duas bases
+    col_f_nota = r._localizar_coluna_nota(df_forn.columns)
+    col_f_valor = r.localizar_coluna(df_forn.columns, ["valor"])
+    col_f_venc = r.localizar_coluna(df_forn.columns, ["venc"])
+
+    col_i_nota = r.localizar_coluna(df_int.columns, ["fiscal", "note"])
+    col_i_valor = r.localizar_coluna(df_int.columns, ["gross", "amount"])
+    col_i_venc = r.localizar_coluna(df_int.columns, ["expire", "date"])
+
+    print("\n=== COLUNAS DETECTADAS ===")
+    print("Fornecedor -> nota:", repr(col_f_nota), "| valor:", repr(col_f_valor),
+          "| venc:", repr(col_f_venc))
+    print("Interna    -> nota:", repr(col_i_nota), "| valor:", repr(col_i_valor),
+          "| venc:", repr(col_i_venc))
+
+    # Prepara a chave interna como texto
+    df_int["_chave"] = df_int[col_i_nota].astype(str).str.strip()
+
+    for nota_pura in NOTAS_INVESTIGAR:
+        chave = r.padronizar_chave_nota(nota_pura)
+        print("\n" + "=" * 60)
+        print("NOTA fornecedor: {}  ->  chave padronizada: {}".format(
+            nota_pura, chave))
+
+        # Linha do fornecedor
+        linha_f = df_forn[
+            df_forn[col_f_nota].apply(r.padronizar_chave_nota) == chave
+        ]
+        if linha_f.empty:
+            print("  [!] Nota nao encontrada na base do fornecedor.")
+            continue
+
+        valor_f_bruto = linha_f.iloc[0][col_f_valor]
+        venc_f_bruto = linha_f.iloc[0][col_f_venc]
+        print("  FORNECEDOR:")
+        print("    valor bruto     : {!r}".format(valor_f_bruto))
+        print("    valor convertido: {!r}".format(r.converter_para_numero(valor_f_bruto)))
+        print("    venc  bruto     : {!r}".format(venc_f_bruto))
+        print("    venc  convertido: {!r}".format(r.converter_para_data(venc_f_bruto)))
+
+        # Linha da base interna
+        linha_i = df_int[df_int["_chave"] == chave]
+        if linha_i.empty:
+            print("  [!] Nota NAO encontrada na base interna com essa chave.")
+            print("      -> Por isso e reprovada (sem correspondencia no join).")
+            # Mostra chaves internas parecidas para ajudar a diagnosticar
+            similares = df_int[df_int["_chave"].str.contains(
+                str(nota_pura), na=False)]
+            if not similares.empty:
+                print("      Chaves internas contendo '{}':".format(nota_pura))
+                for c in similares["_chave"].head(5).tolist():
+                    print("        {!r}".format(c))
+            continue
+
+        valor_i_bruto = linha_i.iloc[0][col_i_valor]
+        venc_i_bruto = linha_i.iloc[0][col_i_venc]
+        print("  INTERNA:")
+        print("    valor bruto     : {!r}".format(valor_i_bruto))
+        print("    valor convertido: {!r}".format(r.converter_para_numero(valor_i_bruto)))
+        print("    venc  bruto     : {!r}".format(venc_i_bruto))
+        print("    venc  convertido: {!r}".format(r.converter_para_data(venc_i_bruto)))
+
+        # Avaliacao final
+        v_f = r.converter_para_numero(valor_f_bruto)
+        v_i = r.converter_para_numero(valor_i_bruto)
+        d_f = r.converter_para_data(venc_f_bruto)
+        d_i = r.converter_para_data(venc_i_bruto)
+
+        print("  --- AVALIACAO ---")
+        if v_f is not None and v_i is not None:
+            print("    diferenca de valor : {}".format(abs(v_f - v_i)))
+        if pd.notna(d_f) and pd.notna(d_i):
+            print("    diferenca de dias  : {}".format(abs((d_f - d_i).days)))
+        else:
+            print("    diferenca de dias  : IMPOSSIVEL (alguma data virou NaT)")
+
+
+if __name__ == "__main__":
+    principal()
