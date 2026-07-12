@@ -1,0 +1,126 @@
+import pandas as pd
+import numpy as np
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+
+# ==============================================================================
+# 1. CARREGAMENTO E CONFIGURAÇÃO DOS ARQUIVOS
+# ==============================================================================
+# Substitua pelos caminhos reais dos seus arquivos
+ARQUIVO_FORNECEDOR = "planilha_fornecedor.xlsx"
+ARQUIVO_BASE_INTERNA = "sua_base_interna.xlsx"
+ARQUIVO_SAIDA_CLIENTE = "Antecipacao_Sinalizada_Cliente.xlsx"
+
+print("Carregando as bases de dados...")
+df_fornecedor = pd.read_excel(ARQUIVO_FORNECEDOR)
+df_base = pd.read_excel(ARQUIVO_BASE_INTERNA)
+
+# ==============================================================================
+# 2. PADRONIZAÇÃO DA CHAVE DE BUSCA (NOTA FISCAL)
+# ==============================================================================
+print("Padronizando o formato das Notas Fiscais...")
+# Remove espacos, converte para string pura e retira casas decimais se houver (ex: 1806097.0 -> 1806097)
+df_fornecedor['NF_Limpa'] = df_fornecedor['NF'].astype(str).str.strip().str.split('.').str[0]
+
+# Aplica a regra: adiciona dois zeros no inicio ("00") e um tracinho um no final ("-1")
+df_fornecedor['NF_Chave_Busca'] = "00" + df_fornecedor['NF_Limpa'] + "-1"
+
+# ==============================================================================
+# 3. RECONCILIAÇÃO DAS BASES (LEFT JOIN)
+# ==============================================================================
+print("Cruzando as informacoes com a base interna...")
+# Unifica a planilha do fornecedor com a sua base usando as chaves padronizadas
+df_reconciliado = pd.merge(
+    df_fornecedor,
+    df_base,
+    left_on='NF_Chave_Busca',
+    right_on='Fiscal Note',
+    how='left'
+)
+
+# Garantir que as colunas de data estao no formato correto de datetime do Pandas
+df_reconciliado['Data vencimento'] = pd.to_datetime(df_reconciliado['Data vencimento'])
+df_reconciliado['Expire Date'] = pd.to_datetime(df_reconciliado['Expire Date'])
+
+# ==============================================================================
+# 4. PROCESSAMENTO DAS REGRAS DE NEGÓCIO E MOTIVOS (LOGICA INTERNA)
+# ==============================================================================
+print("Avaliando elegibilidade de valores e vencimentos...")
+
+# 4.1. Calculos auxiliares de divergencia
+df_reconciliado['Nota_Existe_Na_Base'] = df_reconciliado['Fiscal Note'].notna()
+df_reconciliado['Dif_Dias'] = (df_reconciliado['Data vencimento'] - df_reconciliado['Expire Date']).dt.days.abs()
+df_reconciliado['Dif_Valor'] = (df_reconciliado['Valor'] - df_reconciliado['Gross Amount']).abs()
+
+# 4.2. Definicao das condicoes para mapeamento
+condicoes = [
+    (df_reconciliado['Nota_Existe_Na_Base'] == False),                                 # 1. Nao encontrada
+    ((df_reconciliado['Dif_Valor'] == 0) & (df_reconciliado['Dif_Dias'] <= 4)),          # 2. Totalmente Apta
+    ((df_reconciliado['Dif_Valor'] != 0) & (df_reconciliado['Dif_Dias'] > 4)),           # 3. Ambos divergentes
+    ((df_reconciliado['Dif_Valor'] != 0) & (df_reconciliado['Dif_Dias'] <= 4)),          # 4. Apenas valor divergente
+    ((df_reconciliado['Dif_Valor'] == 0) & (df_reconciliado['Dif_Dias'] > 4))            # 5. Apenas data divergente
+]
+
+# 4.3. Atribuicao de status e diagnosticos
+lista_status = ["Não Apta", "Apta", "Não Apta", "Não Apta", "Não Apta"]
+lista_motivos = [
+    "Não está na base",
+    "Dentro dos critérios",
+    "Valor e Vencimento divergentes",
+    "Valor divergente",
+    "Vencimento divergente"
+]
+
+df_reconciliado['Status_Antecipacao'] = np.select(condicoes, lista_status, default="Erro na análise")
+df_reconciliado['Motivo_Interno'] = np.select(condicoes, lista_motivos, default="Erro na análise")
+
+# ==============================================================================
+# 5. EXPORTAÇÃO E FORMATAÇÃO VISUAL (OPENPYXL)
+# ==============================================================================
+print("Gerando relatorio formatado para o cliente...")
+
+# Removemos as colunas de calculo internas para entregar a planilha igual a dele
+colunas_originais_cliente = [col for col in df_fornecedor.columns if col not in ['NF_Limpa', 'NF_Chave_Busca']]
+# Mantemos apenas o status geral na ultima coluna para controle visual do cliente
+df_saida_cliente = df_reconciliado[colunas_originais_cliente + ['Status_Antecipacao']].copy()
+
+# Salva o arquivo intermediario
+df_saida_cliente.to_excel(ARQUIVO_SAIDA_CLIENTE, index=False)
+
+# Carrega o workbook para aplicar a estilizacao em vermelho nas indisponiveis
+wb = openpyxl.load_workbook(ARQUIVO_SAIDA_CLIENTE)
+ws = wb.active
+ws.views.sheetView[0].showGridLines = True # Mantem as linhas de grade visiveis
+
+# Configuracoes de estilo (Tom vermelho claro pastel para uso corporativo)
+vermelho_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+texto_vermelho_font = Font(name="Calibri", size=11, color="C00000", bold=True)
+
+idx_coluna_status = df_saida_cliente.columns.get_loc('Status_Antecipacao') + 1
+
+# Varre as linhas da tabela (comecando na 2 para ignorar cabecalho)
+for row_idx in range(2, ws.max_row + 1):
+    status_atual = ws.cell(row=row_idx, column=idx_coluna_status).value
+    
+    # Se a nota nao estiver disponivel, pinta toda a linha correspondente em vermelho
+    if status_atual == "Não Apta":
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = vermelho_fill
+            
+            # Aplica destaque em negrito e vermelho no texto da coluna final de Status
+            if col_idx == idx_coluna_status:
+                cell.font = texto_vermelho_font
+    else:
+        # Se estiver apta, limpa a palavra para deixar discreto ou mantem normal
+        ws.cell(row=row_idx, column=idx_coluna_status).value = "Disponível"
+
+# Ajuste automatico do tamanho das colunas para evitar o erro de '###' no Excel
+for col in ws.columns:
+    max_len = max(len(str(cell.value or '')) for cell in col)
+    col_letter = openpyxl.utils.get_column_letter(col[0].column)
+    ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+# Salva o arquivo final polido
+wb.save(ARQUIVO_SAIDA_CLIENTE)
+print(f"Concluido com sucesso! Arquivo pronto em: '{ARQUIVO_SAIDA_CLIENTE}'")
