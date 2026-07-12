@@ -1,0 +1,232 @@
+# -*- coding: utf-8 -*-
+"""
+Diagnostico autossuficiente de notas reprovadas.
+
+Este script NAO depende de nenhum outro arquivo. Toda a logica de leitura e
+conversao esta contida aqui. Basta ajustar os caminhos e a lista de notas
+abaixo e executar. Ele nao grava nenhum arquivo: apenas le e imprime.
+
+Como usar:
+    python diagnostico_autossuficiente.py
+"""
+
+import re
+import pandas as pd
+
+# ===================================================================
+# AJUSTE AQUI OS CAMINHOS DOS SEUS ARQUIVOS REAIS
+# ===================================================================
+CAMINHO_FORNECEDOR = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\07.07_ - P&G.xlsx"
+CAMINHO_INTERNA = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\RAIASIL20260707060113.XLS"
+
+# Numeros de nota (puros, como aparecem no fornecedor) que deveriam ser aptos
+NOTAS_INVESTIGAR = ["1807789", "1807791", "1807792", "1807794"]
+# ===================================================================
+
+
+# -------------------------------------------------------------------
+# FUNCOES DE APOIO (copiadas da logica principal, sem dependencias)
+# -------------------------------------------------------------------
+
+def padronizar_chave_nota(valor):
+    """Converte o numero da nota para a chave padronizada '00NUMERO-1'."""
+    if valor is None:
+        return ""
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return ""
+    texto = re.sub(r"\.0+$", "", texto).strip()
+    return "00{}-1".format(texto)
+
+
+def converter_para_numero(valor):
+    """Converte texto monetario (formato BR ou internacional) em float."""
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return None
+    texto = re.sub(r"[^\d.,\-]", "", texto)
+    if texto == "":
+        return None
+    tem_virgula = "," in texto
+    tem_ponto = "." in texto
+    if tem_virgula and tem_ponto:
+        texto = texto.replace(".", "").replace(",", ".")
+    elif tem_virgula:
+        texto = texto.replace(",", ".")
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+
+def converter_para_data(valor):
+    """Converte data textual ou numero de serie do Excel em Timestamp."""
+    if valor is None:
+        return pd.NaT
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return pd.NaT
+    # Numero de serie do Excel
+    if re.fullmatch(r"\d+(\.\d+)?", texto):
+        try:
+            numero_serie = float(texto)
+            if 20000 <= numero_serie <= 80000:
+                return pd.Timestamp("1899-12-30") + pd.Timedelta(days=numero_serie)
+        except (ValueError, OverflowError):
+            pass
+    return pd.to_datetime(texto, dayfirst=True, format="mixed", errors="coerce")
+
+
+def normalizar_texto(texto):
+    """Normaliza um texto para busca por aproximacao."""
+    if texto is None:
+        return ""
+    texto = str(texto)
+    texto = re.sub(r"[\r\n\t]+", " ", texto)
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip().lower()
+
+
+def localizar_coluna(colunas, palavras_chave):
+    """Localiza uma coluna por aproximacao de palavras-chave."""
+    palavras = [normalizar_texto(p) for p in palavras_chave]
+    for coluna in colunas:
+        cn = normalizar_texto(coluna)
+        if all(p in cn for p in palavras):
+            return coluna
+    return None
+
+
+def localizar_coluna_nota(colunas):
+    """Localiza a coluna de nota fiscal, exato antes de aproximacao."""
+    for coluna in colunas:
+        if normalizar_texto(coluna) in ("nf", "nota", "nota fiscal"):
+            return coluna
+    aprox = localizar_coluna(colunas, ["nota"])
+    if aprox is not None:
+        return aprox
+    return localizar_coluna(colunas, ["nf"])
+
+
+def detectar_delimitador(caminho):
+    """Detecta se o arquivo texto usa tabulacao ou ponto e virgula."""
+    with open(caminho, "r", encoding="utf-8", errors="ignore") as arq:
+        primeira = arq.readline()
+    if primeira.count("\t") >= primeira.count(";") and primeira.count("\t") > 0:
+        return "\t"
+    if primeira.count(";") > 0:
+        return ";"
+    return "\t"
+
+
+def detectar_linha_cabecalho(df_bruto, termos, minimo=2):
+    """Localiza a linha de cabecalho real em planilha lida com header=None."""
+    termos_norm = [normalizar_texto(t) for t in termos]
+    limite = min(30, len(df_bruto))
+    for i in range(limite):
+        linha = " ".join(normalizar_texto(v) for v in df_bruto.iloc[i].tolist())
+        if sum(1 for t in termos_norm if t in linha) >= minimo:
+            return i
+    raise ValueError("Cabecalho do fornecedor nao localizado.")
+
+
+def ler_base_fornecedor(caminho):
+    """Le a planilha do fornecedor detectando a linha de cabecalho real."""
+    df_bruto = pd.read_excel(caminho, header=None, dtype=str)
+    linha = detectar_linha_cabecalho(df_bruto, ["nf", "valor", "venc"])
+    df = pd.read_excel(caminho, header=linha, dtype=str)
+    colunas_validas = [c for c in df.columns if not str(c).startswith("Unnamed:")]
+    df = df[colunas_validas]
+    df = df.dropna(axis=0, how="all").reset_index(drop=True)
+    return df
+
+
+def ler_base_interna(caminho):
+    """Le a base interna como texto delimitado."""
+    delim = detectar_delimitador(caminho)
+    return pd.read_csv(caminho, sep=delim, dtype=str, engine="python",
+                       encoding_errors="ignore")
+
+
+# -------------------------------------------------------------------
+# DIAGNOSTICO
+# -------------------------------------------------------------------
+
+def principal():
+    print("Lendo base do fornecedor...")
+    df_forn = ler_base_fornecedor(CAMINHO_FORNECEDOR)
+    print("Lendo base interna...")
+    df_int = ler_base_interna(CAMINHO_INTERNA)
+
+    col_f_nota = localizar_coluna_nota(df_forn.columns)
+    col_f_valor = localizar_coluna(df_forn.columns, ["valor"])
+    col_f_venc = localizar_coluna(df_forn.columns, ["venc"])
+
+    col_i_nota = localizar_coluna(df_int.columns, ["fiscal", "note"])
+    col_i_valor = localizar_coluna(df_int.columns, ["gross", "amount"])
+    col_i_venc = localizar_coluna(df_int.columns, ["expire", "date"])
+
+    print("\n=== COLUNAS DETECTADAS ===")
+    print("Fornecedor -> nota:", repr(col_f_nota), "| valor:", repr(col_f_valor),
+          "| venc:", repr(col_f_venc))
+    print("Interna    -> nota:", repr(col_i_nota), "| valor:", repr(col_i_valor),
+          "| venc:", repr(col_i_venc))
+    print("Colunas reais da base interna:", list(df_int.columns))
+
+    df_int["_chave"] = df_int[col_i_nota].astype(str).str.strip()
+
+    for nota_pura in NOTAS_INVESTIGAR:
+        chave = padronizar_chave_nota(nota_pura)
+        print("\n" + "=" * 60)
+        print("NOTA fornecedor: {}  ->  chave padronizada: {}".format(
+            nota_pura, chave))
+
+        linha_f = df_forn[df_forn[col_f_nota].apply(padronizar_chave_nota) == chave]
+        if linha_f.empty:
+            print("  [!] Nota nao encontrada na base do fornecedor.")
+            continue
+
+        vf_bruto = linha_f.iloc[0][col_f_valor]
+        df_bruto = linha_f.iloc[0][col_f_venc]
+        print("  FORNECEDOR:")
+        print("    valor bruto     :", repr(vf_bruto))
+        print("    valor convertido:", repr(converter_para_numero(vf_bruto)))
+        print("    venc  bruto     :", repr(df_bruto))
+        print("    venc  convertido:", repr(converter_para_data(df_bruto)))
+
+        linha_i = df_int[df_int["_chave"] == chave]
+        if linha_i.empty:
+            print("  [!] Nota NAO encontrada na base interna com essa chave.")
+            print("      -> Reprovada por falta de correspondencia no join.")
+            similares = df_int[df_int["_chave"].str.contains(str(nota_pura), na=False)]
+            if not similares.empty:
+                print("      Chaves internas contendo '{}':".format(nota_pura))
+                for c in similares["_chave"].head(5).tolist():
+                    print("        ", repr(c))
+            continue
+
+        vi_bruto = linha_i.iloc[0][col_i_valor]
+        di_bruto = linha_i.iloc[0][col_i_venc]
+        print("  INTERNA:")
+        print("    valor bruto     :", repr(vi_bruto))
+        print("    valor convertido:", repr(converter_para_numero(vi_bruto)))
+        print("    venc  bruto     :", repr(di_bruto))
+        print("    venc  convertido:", repr(converter_para_data(di_bruto)))
+
+        v_f = converter_para_numero(vf_bruto)
+        v_i = converter_para_numero(vi_bruto)
+        d_f = converter_para_data(df_bruto)
+        d_i = converter_para_data(di_bruto)
+        print("  --- AVALIACAO ---")
+        if v_f is not None and v_i is not None:
+            print("    diferenca de valor:", abs(v_f - v_i))
+        if pd.notna(d_f) and pd.notna(d_i):
+            print("    diferenca de dias :", abs((d_f - d_i).days))
+        else:
+            print("    diferenca de dias : IMPOSSIVEL (alguma data virou NaT)")
+
+
+if __name__ == "__main__":
+    principal()
