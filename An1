@@ -1,0 +1,135 @@
+import pandas as pd
+import numpy as np
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+
+# ==============================================================================
+# 1. CARREGAMENTO E CONFIGURAÇÃO DOS ARQUIVOS
+# ==============================================================================
+ARQUIVO_FORNECEDOR = "planilha_fornecedor.xlsx"
+ARQUIVO_BASE_INTERNA = "sua_base_interna.xlsx" 
+ARQUIVO_SAIDA_CLIENTE = "Antecipacao_Sinalizada_Cliente.xlsx"
+
+print("Carregando as bases de dados...")
+df_fornecedor = pd.read_excel(ARQUIVO_FORNECEDOR)
+
+try:
+    df_base = pd.read_csv(ARQUIVO_BASE_INTERNA, sep='\t', encoding='latin-1')
+except Exception:
+    df_base = pd.read_csv(ARQUIVO_BASE_INTERNA, sep=';', encoding='latin-1')
+
+# ==============================================================================
+# 2. NORMALIZAÇÃO DE COLUNAS
+# ==============================================================================
+print("Normalizando o nome das colunas...")
+
+# Salva o mapeamento exato das colunas originais do fornecedor antes de qualquer alteracao
+mapeamento_colunas_originais = {str(col).strip().lower(): col for col in df_fornecedor.columns}
+
+# Cria as copias de processamento interno aplicando a limpeza de strings de forma segura
+df_forn_proc = df_fornecedor.copy()
+df_forn_proc.columns = [str(col).strip().lower() for col in df_forn_proc.columns]
+
+df_base_proc = df_base.copy()
+df_base_proc.columns = [str(col).strip().lower() for col in df_base_proc.columns]
+
+# Mapeamento dos nomes de colunas que serao usados na lógica
+col_nf = "nf"
+col_valor_fornecedor = "valor"
+col_vencimento_fornecedor = "data vencimento"
+
+col_fiscal_note = "fiscal note"
+col_gross_amount = "gross amount"
+col_expire_date = "expire date"
+
+# ==============================================================================
+# 3. PADRONIZAÇÃO DA CHAVE DE BUSCA (NOTA FISCAL)
+# ==============================================================================
+print("Padronizando o formato das Notas Fiscais...")
+df_forn_proc['nf_limpa'] = df_forn_proc[col_nf].astype(str).str.strip().str.split('.').str[0]
+df_forn_proc['nf_chave_busca'] = "00" + df_forn_proc['nf_limpa'] + "-1"
+
+# ==============================================================================
+# 4. RECONCILIAÇÃO DAS BASES (LEFT JOIN)
+# ==============================================================================
+print("Cruzando as informacoes com a base interna...")
+df_reconciliado = pd.merge(
+    df_forn_proc,
+    df_base_proc,
+    left_on='nf_chave_busca',
+    right_on=col_fiscal_note,
+    how='left'
+)
+
+# Converte datas tratando possiveis strings ou formatos invalidos
+df_reconciliado[col_vencimento_fornecedor] = pd.to_datetime(df_reconciliado[col_vencimento_fornecedor], errors='coerce')
+df_reconciliado[col_expire_date] = pd.to_datetime(df_reconciliado[col_expire_date], errors='coerce')
+
+# ==============================================================================
+# 5. PROCESSAMENTO DAS REGRAS DE NEGÓCIO
+# ==============================================================================
+print("Avaliando elegibilidade de valores e vencimentos...")
+df_reconciliado['nota_existe_na_base'] = df_reconciliado[col_fiscal_note].notna()
+df_reconciliado['dif_dias'] = (df_reconciliado[col_vencimento_fornecedor] - df_reconciliado[col_expire_date]).dt.days.abs()
+df_reconciliado['dif_valor'] = (df_reconciliado[col_valor_fornecedor] - df_reconciliado[col_gross_amount]).abs()
+
+condicoes = [
+    (df_reconciliado['nota_existe_na_base'] == False),
+    ((df_reconciliado['dif_valor'] == 0) & (df_reconciliado['dif_dias'] <= 4)),
+    ((df_reconciliado['dif_valor'] != 0) & (df_reconciliado['dif_dias'] > 4)),
+    ((df_reconciliado['dif_valor'] != 0) & (df_reconciliado['dif_dias'] <= 4)),
+    ((df_reconciliado['dif_valor'] == 0) & (df_reconciliado['dif_dias'] > 4))
+]
+
+lista_status = ["Não Apta", "Apta", "Não Apta", "Não Apta", "Não Apta"]
+df_reconciliado['status_antecipacao'] = np.select(condicoes, lista_status, default="Erro na análise")
+
+# ==============================================================================
+# 6. FILTRAGEM E RESTAURAÇÃO DOS NOMES ORIGINAIS (SEM FATIAMENTO ESTÁTICO)
+# ==============================================================================
+print("Restaurando as colunas originais do fornecedor...")
+
+# 1. Filtra estritamente as colunas estruturais que pertenciam ao arquivo do fornecedor antes do merge
+colunas_originais_limpas = [col for col in df_forn_proc.columns if col not in ['nf_limpa', 'nf_chave_busca']]
+df_saida_cliente = df_reconciliado[colunas_originais_limpas].copy()
+
+# 2. Devolve os nomes exatos originais (com as maiúsculas e espaços) usando o dicionario mapeado
+df_saida_cliente.columns = [mapeamento_colunas_originais[col] for col in df_saida_cliente.columns]
+
+# 3. Adiciona a coluna final de status com a grafia correta
+df_saida_cliente['Status_Antecipacao'] = df_reconciliado['status_antecipacao']
+
+# ==============================================================================
+# 7. EXPORTAÇÃO E FORMATAÇÃO VISUAL (OPENPYXL)
+# ==============================================================================
+print("Gerando relatorio formatado para o cliente...")
+df_saida_cliente.to_excel(ARQUIVO_SAIDA_CLIENTE, index=False)
+
+wb = openpyxl.load_workbook(ARQUIVO_SAIDA_CLIENTE)
+ws = wb.active
+ws.views.sheetView[0].showGridLines = True
+
+vermelho_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+texto_vermelho_font = Font(name="Calibri", size=11, color="C00000", bold=True)
+
+idx_coluna_status = df_saida_cliente.columns.get_loc('Status_Antecipacao') + 1
+
+for row_idx in range(2, ws.max_row + 1):
+    status_atual = ws.cell(row=row_idx, column=idx_coluna_status).value
+    
+    if status_atual == "Não Apta":
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = vermelho_fill
+            if col_idx == idx_coluna_status:
+                cell.font = texto_vermelho_font
+    else:
+        ws.cell(row=row_idx, column=idx_coluna_status).value = "Disponível"
+
+for col in ws.columns:
+    max_len = max(len(str(cell.value or '')), 10)
+    col_letter = openpyxl.utils.get_column_letter(col[0].column)
+    ws.column_dimensions[col_letter].width = max_len + 4
+
+wb.save(ARQUIVO_SAIDA_CLIENTE)
+print("Concluido com sucesso! Arquivo pronto em: '" + ARQUIVO_SAIDA_CLIENTE + "'")
