@@ -1,0 +1,943 @@
+# -*- coding: utf-8 -*-
+"""
+Reconciliacao Financeira - Sinalizacao de Antecipacao de Notas Fiscais
+======================================================================
+
+Este script cruza a base de Notas Fiscais enviada pelo fornecedor com a base
+interna corporativa de validacao, aplica os criterios de elegibilidade de
+antecipacao (valor e vencimento) e gera um arquivo Excel formatado para o
+cliente, preservando o layout original do fornecedor e adicionando apenas a
+coluna de status.
+
+Dependencias:
+    pip install pandas openpyxl
+
+Uso:
+    python reconciliacao_antecipacao.py
+    (ajuste os caminhos em CONFIG na secao main)
+"""
+
+import os
+import re
+import unicodedata
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+
+# ---------------------------------------------------------------------------
+# CONSTANTES DE FORMATACAO
+# ---------------------------------------------------------------------------
+
+# Preenchimento vermelho claro pastel para linhas nao aptas
+FILL_NAO_APTA = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+
+# Fonte vermelha escura em negrito para o texto do status nao apto
+FONT_STATUS_NAO_APTA = Font(color="C00000", bold=True)
+
+# Tolerancia em dias para o criterio de vencimento
+TOLERANCIA_DIAS_VENCIMENTO = 4
+
+# Nome do arquivo final
+NOME_ARQUIVO_SAIDA = "Antecipacao_Sinalizada_Cliente.xlsx"
+
+# Nome da coluna de status adicionada ao final
+COLUNA_STATUS = "Status_Antecipacao"
+
+# Nomes das colunas de auditoria visiveis no arquivo final. Ajudam o usuario a
+# entender o motivo de cada classificacao (diferenca de valor e de dias).
+COL_AUD_VALOR_INTERNO = "Valor_Base_Interna"
+COL_AUD_VENC_INTERNO = "Vencimento_Base_Interna"
+COL_AUD_DIF_VALOR = "Diferenca_Valor"
+COL_AUD_DIF_DIAS = "Diferenca_Dias"
+
+# Nomes internos de calculo (serao ocultados no arquivo final)
+COL_CHAVE = "_chave_padronizada"
+COL_VALOR_INTERNO = "_gross_amount_interno"
+COL_VENC_INTERNO = "_expire_date_interno"
+COL_ELEGIVEL = "_elegivel"
+
+# Nome da aba com as notas disponiveis para antecipar (layout do cliente).
+NOME_ABA_ANTECIPAR = "Antecipar"
+
+# Cabecalhos das colunas calculadas da aba de antecipacao, na ordem exata do
+# layout do cliente (apos as colunas originais da base interna).
+CABECALHOS_CALCULADOS = [
+    "Payment Date Customer",
+    "Anticipation (Include 'y')",
+    "Customer Net Amount",
+    "Days Before Due Date",
+    "Normal Discount",
+    "Amount with Cash Discount",
+]
+
+
+# ---------------------------------------------------------------------------
+# UTILITARIOS DE NORMALIZACAO DE TEXTO
+# ---------------------------------------------------------------------------
+
+def _normalizar_texto(texto):
+    """
+    Normaliza uma string para comparacao por aproximacao: remove acentos,
+    converte para minusculas, colapsa espacos multiplos e quebras de linha.
+    """
+    if texto is None:
+        return ""
+    texto = str(texto)
+    # Remove acentos
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    # Substitui quebras de linha e tabulacoes por espaco
+    texto = re.sub(r"[\r\n\t]+", " ", texto)
+    # Colapsa espacos multiplos
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip().lower()
+
+
+def localizar_coluna(colunas, palavras_chave, obrigatoria=True):
+    """
+    Localiza o nome real de uma coluna por aproximacao, buscando por palavras-chave.
+
+    Parametros:
+        colunas: lista com os nomes reais das colunas do DataFrame.
+        palavras_chave: lista de termos que devem estar presentes no nome
+                        normalizado da coluna (todos os termos devem existir).
+        obrigatoria: se True, levanta erro caso a coluna nao seja encontrada.
+
+    Retorna:
+        O nome real (original) da coluna encontrada, ou None se opcional.
+    """
+    palavras_norm = [_normalizar_texto(p) for p in palavras_chave]
+
+    for coluna in colunas:
+        coluna_norm = _normalizar_texto(coluna)
+        if all(palavra in coluna_norm for palavra in palavras_norm):
+            return coluna
+
+    if obrigatoria:
+        raise KeyError(
+            "Nao foi possivel localizar a coluna contendo os termos: "
+            f"{palavras_chave}. Colunas disponiveis: {list(colunas)}"
+        )
+    return None
+
+
+def _localizar_coluna_nota(colunas):
+    """
+    Localiza a coluna de Nota Fiscal do fornecedor.
+
+    Estrategia em ordem de prioridade:
+        1. Correspondencia exata com "nf" ou "nota" (cabecalho isolado como "NF").
+        2. Aproximacao pela palavra "nota".
+        3. Aproximacao pela palavra "nf".
+
+    A correspondencia exata evita falsos positivos com colunas que apenas
+    contenham as letras "nf" (por exemplo "conferencia").
+    """
+    # Etapa 1: correspondencia exata
+    for coluna in colunas:
+        if _normalizar_texto(coluna) in ("nf", "nota", "nota fiscal"):
+            return coluna
+
+    # Etapa 2: aproximacao por "nota"
+    encontrada = localizar_coluna(colunas, ["nota"], obrigatoria=False)
+    if encontrada is not None:
+        return encontrada
+
+    # Etapa 3: aproximacao por "nf"
+    return localizar_coluna(colunas, ["nf"])
+
+
+# ---------------------------------------------------------------------------
+# LEITURA DAS BASES
+# ---------------------------------------------------------------------------
+
+# Termos usados para reconhecer a linha de cabecalho real do fornecedor.
+# A linha valida deve conter pelo menos os termos abaixo (normalizados).
+TERMOS_CABECALHO_FORNECEDOR = ["nf", "valor", "venc"]
+
+
+def _detectar_linha_cabecalho(df_bruto, termos_esperados, minimo_correspondencias=2):
+    """
+    Localiza o indice da linha que contem os cabecalhos reais em uma planilha
+    lida sem cabecalho (header=None).
+
+    O arquivo do fornecedor pode ter blocos de resumo no topo, fazendo com que
+    os cabecalhos verdadeiros (Cliente, NF, Valor, Data vencimento, etc.) so
+    aparecam algumas linhas abaixo. Esta funcao varre as primeiras linhas e
+    escolhe aquela cujo conteudo bate com os termos esperados.
+
+    Parametros:
+        df_bruto: DataFrame lido com header=None.
+        termos_esperados: lista de termos que devem aparecer na linha de titulo.
+        minimo_correspondencias: quantos termos precisam bater para aceitar a linha.
+
+    Retorna:
+        Indice inteiro da linha de cabecalho.
+
+    Levanta:
+        ValueError se nenhuma linha atender ao criterio.
+    """
+    termos_norm = [_normalizar_texto(t) for t in termos_esperados]
+    limite_varredura = min(30, len(df_bruto))
+
+    for indice in range(limite_varredura):
+        celulas = [_normalizar_texto(v) for v in df_bruto.iloc[indice].tolist()]
+        linha_texto = " ".join(celulas)
+
+        correspondencias = sum(1 for termo in termos_norm if termo in linha_texto)
+        if correspondencias >= minimo_correspondencias:
+            return indice
+
+    raise ValueError(
+        "Nao foi possivel localizar a linha de cabecalho do fornecedor. "
+        "Termos procurados: {}".format(termos_esperados)
+    )
+
+
+def ler_base_fornecedor(caminho):
+    """
+    Le a planilha do fornecedor (Excel padrao) e retorna um DataFrame.
+
+    A planilha do fornecedor pode conter blocos de resumo no topo, deslocando
+    os cabecalhos reais para baixo. Por isso a leitura e feita em duas etapas:
+    primeiro sem cabecalho, para localizar a linha de titulo real, e depois
+    com essa linha como cabecalho, descartando o que estiver acima.
+    """
+    print("Lendo base do fornecedor: {}".format(caminho))
+
+    # Etapa 1: leitura crua, sem assumir cabecalho
+    df_bruto = pd.read_excel(caminho, header=None, dtype=str)
+
+    # Etapa 2: identifica a linha onde estao os cabecalhos reais
+    linha_cabecalho = _detectar_linha_cabecalho(
+        df_bruto, TERMOS_CABECALHO_FORNECEDOR
+    )
+    print("Linha de cabecalho do fornecedor detectada no indice: {}".format(
+        linha_cabecalho))
+
+    # Etapa 3: reconstroi o DataFrame usando a linha correta como cabecalho
+    df = pd.read_excel(caminho, header=linha_cabecalho, dtype=str)
+
+    # Descarta colunas sem nome (geradas por celulas de layout a direita da
+    # tabela real), preservando todas as colunas nomeadas do fornecedor,
+    # inclusive as que estiverem vazias (ex: CNPJ), para manter o layout fiel.
+    colunas_validas = [
+        coluna for coluna in df.columns
+        if not str(coluna).startswith("Unnamed:")
+    ]
+    df = df[colunas_validas]
+
+    # Remove linhas totalmente vazias remanescentes
+    df = df.dropna(axis=0, how="all").reset_index(drop=True)
+
+    print("Base do fornecedor carregada: {} linhas, {} colunas".format(
+        df.shape[0], df.shape[1]))
+    return df
+
+
+def ler_base_interna(caminho):
+    """
+    Le a base interna corporativa. Apesar de poder ter extensao .xlsx, seu
+    conteudo real e texto delimitado (tabulacao ou ponto e virgula). A funcao
+    detecta o delimitador automaticamente e faz o parsing.
+
+    Retorna um DataFrame com o conteudo da base interna.
+    """
+    print("Lendo base interna (texto oculto): {}".format(caminho))
+
+    # Detecta o delimitador analisando a primeira linha do arquivo
+    delimitador = _detectar_delimitador(caminho)
+    print("Delimitador detectado na base interna: '{}'".format(
+        "TAB" if delimitador == "\t" else delimitador))
+
+    df = pd.read_csv(
+        caminho,
+        sep=delimitador,
+        dtype=str,
+        engine="python",
+        encoding_errors="ignore",
+    )
+    print("Base interna carregada: {} linhas, {} colunas".format(
+        df.shape[0], df.shape[1]))
+    return df
+
+
+def _detectar_delimitador(caminho):
+    """
+    Detecta o delimitador de um arquivo texto lendo a primeira linha e
+    comparando a contagem de tabulacoes contra pontos e virgula.
+    """
+    with open(caminho, "r", encoding="utf-8", errors="ignore") as arquivo:
+        primeira_linha = arquivo.readline()
+
+    qtd_tab = primeira_linha.count("\t")
+    qtd_ponto_virgula = primeira_linha.count(";")
+
+    if qtd_tab >= qtd_ponto_virgula and qtd_tab > 0:
+        return "\t"
+    if qtd_ponto_virgula > 0:
+        return ";"
+    # Fallback: assume tabulacao
+    return "\t"
+
+
+# ---------------------------------------------------------------------------
+# PADRONIZACAO DE VALORES
+# ---------------------------------------------------------------------------
+
+def padronizar_chave_nota(valor):
+    """
+    Converte o numero da Nota Fiscal do fornecedor para a chave padronizada
+    usada no cruzamento com a base interna.
+
+    Regras:
+        - Converte para string pura.
+        - Remove espacos nas pontas.
+        - Remove casa decimal flutuante ".0" (ex: '1806097.0' -> '1806097').
+        - Adiciona "00" no inicio e "-1" no final.
+
+    Exemplo: 1806097 -> '001806097-1'
+    """
+    if valor is None:
+        return ""
+
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return ""
+
+    # Remove decimal flutuante ".0" ao final (ex: vindo de leitura numerica)
+    texto = re.sub(r"\.0+$", "", texto)
+
+    # Remove qualquer caractere que nao seja digito remanescente das pontas
+    texto = texto.strip()
+
+    return "00{}-1".format(texto)
+
+
+def converter_para_numero(valor):
+    """
+    Converte um valor textual monetario em float, tratando os formatos
+    brasileiro (1.234,56) e internacional (1234.56).
+
+    Retorna float ou None caso a conversao nao seja possivel.
+    """
+    if valor is None:
+        return None
+
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return None
+
+    # Remove simbolos de moeda e espacos
+    texto = re.sub(r"[^\d.,\-]", "", texto)
+    if texto == "":
+        return None
+
+    tem_virgula = "," in texto
+    tem_ponto = "." in texto
+
+    if tem_virgula and tem_ponto:
+        # Formato brasileiro: ponto e milhar, virgula e decimal
+        texto = texto.replace(".", "").replace(",", ".")
+    elif tem_virgula:
+        # Apenas virgula: assume decimal brasileiro
+        texto = texto.replace(",", ".")
+    # Apenas ponto ou nenhum: ja esta no formato adequado
+
+    try:
+        return float(texto)
+    except ValueError:
+        return None
+
+
+def converter_para_data(valor):
+    """
+    Converte um valor de data em pandas.Timestamp.
+
+    Trata as seguintes situacoes:
+        1. Numero de serie do Excel (ex: 46233 = 30/07/2026): quando a base
+           interna vem como texto delimitado, as datas podem chegar como o
+           numero de dias desde a epoca do Excel (1899-12-30) em vez de texto
+           formatado. Esses valores sao convertidos com base na epoca correta.
+        2. Data com ano no inicio (AAAA-MM-DD ou AAAA/MM/DD): interpretada
+           sempre como ano-mes-dia. Nunca aplica dayfirst nesse caso, pois
+           faria o dia e o mes serem trocados (ex: 2026-08-03 viraria 08 de
+           marco em vez de 03 de agosto).
+        3. Data com dia no inicio (dd/mm/aaaa): padrao brasileiro, com dayfirst.
+        4. Valor invalido ou vazio, que resulta em NaT.
+
+    Retorna Timestamp ou NaT caso a conversao nao seja possivel.
+    """
+    if valor is None:
+        return pd.NaT
+
+    texto = str(valor).strip()
+    if texto == "" or texto.lower() == "nan":
+        return pd.NaT
+
+    # Situacao 1: numero de serie do Excel.
+    # Valor puramente numerico dentro de uma faixa plausivel de datas.
+    # A faixa 20000-80000 cobre aproximadamente 1954 a 2119.
+    if re.fullmatch(r"\d+(\.\d+)?", texto):
+        try:
+            numero_serie = float(texto)
+            if 20000 <= numero_serie <= 80000:
+                epoca_excel = pd.Timestamp("1899-12-30")
+                return epoca_excel + pd.Timedelta(days=numero_serie)
+        except (ValueError, OverflowError):
+            pass
+
+    # Situacao 2: data com ano no inicio (4 digitos seguidos de - ou /).
+    # Nesses casos a ordem e sempre ano-mes-dia; dayfirst NAO se aplica.
+    if re.match(r"^\d{4}[-/]", texto):
+        return pd.to_datetime(texto, dayfirst=False, errors="coerce")
+
+    # Situacao 3: demais formatos textuais, padrao brasileiro dd/mm/aaaa.
+    return pd.to_datetime(texto, dayfirst=True, errors="coerce")
+
+
+# ---------------------------------------------------------------------------
+# FORMATACAO UNIFORME E CALCULO DE DIFERENCAS (AUDITORIA)
+# ---------------------------------------------------------------------------
+
+def _formatar_valor_br(numero):
+    """
+    Formata um numero no padrao monetario brasileiro (1.234.567,89).
+
+    Recebe um float (ja convertido) e devolve texto. Valores ausentes ou
+    invalidos resultam em string vazia, para nao poluir a auditoria.
+    """
+    if numero is None or pd.isna(numero):
+        return ""
+    # Formata com separador de milhar e duas casas, depois troca os separadores
+    # do padrao ingles (1,234.56) para o brasileiro (1.234,56).
+    texto = "{:,.2f}".format(float(numero))
+    texto = texto.replace(",", "X").replace(".", ",").replace("X", ".")
+    return texto
+
+
+def _formatar_data_br(data):
+    """
+    Formata um Timestamp no padrao brasileiro dd/mm/aaaa.
+
+    Datas ausentes ou invalidas resultam em string vazia.
+    """
+    if data is None or pd.isna(data):
+        return ""
+    return pd.Timestamp(data).strftime("%d/%m/%Y")
+
+
+def _calcular_diferenca_valor(valor_forn, valor_interno):
+    """
+    Calcula a diferenca de valor (fornecedor menos interna) como float,
+    arredondada em duas casas. Retorna string vazia se algum lado for ausente.
+    """
+    if valor_forn is None or pd.isna(valor_forn):
+        return ""
+    if valor_interno is None or pd.isna(valor_interno):
+        return ""
+    return round(float(valor_forn) - float(valor_interno), 2)
+
+
+def _calcular_diferenca_dias(venc_forn, venc_interno):
+    """
+    Calcula a diferenca de dias (fornecedor menos interna) como inteiro.
+    Retorna string vazia se algum lado for ausente.
+    """
+    if venc_forn is None or pd.isna(venc_forn):
+        return ""
+    if venc_interno is None or pd.isna(venc_interno):
+        return ""
+    return int((venc_forn - venc_interno).days)
+
+
+# ---------------------------------------------------------------------------
+# LOGICA DE RECONCILIACAO
+# ---------------------------------------------------------------------------
+
+def reconciliar(df_fornecedor, df_interna):
+    """
+    Executa o cruzamento (Left Join) entre a base do fornecedor e a base
+    interna, aplicando os criterios de elegibilidade.
+
+    Retorna:
+        DataFrame do fornecedor original acrescido das colunas internas de
+        calculo e da coluna de status.
+    """
+    print("Iniciando reconciliacao...")
+
+    # --- Identificacao dinamica das colunas do fornecedor ---
+    # A coluna de nota fiscal e buscada primeiro por correspondencia exata
+    # (o cabecalho costuma ser apenas "NF"), com fallback por aproximacao.
+    col_forn_nota = _localizar_coluna_nota(df_fornecedor.columns)
+
+    col_forn_valor = localizar_coluna(df_fornecedor.columns, ["valor"])
+    col_forn_venc = localizar_coluna(df_fornecedor.columns, ["venc"])
+
+    print("Colunas do fornecedor identificadas -> "
+          "Nota: '{}' | Valor: '{}' | Vencimento: '{}'".format(
+              col_forn_nota, col_forn_valor, col_forn_venc))
+
+    # --- Identificacao dinamica das colunas da base interna ---
+    col_int_nota = localizar_coluna(df_interna.columns, ["fiscal", "note"])
+    col_int_valor = localizar_coluna(df_interna.columns, ["gross", "amount"])
+    col_int_venc = localizar_coluna(df_interna.columns, ["expire", "date"])
+
+    print("Colunas da base interna identificadas -> "
+          "Fiscal Note: '{}' | Gross Amount: '{}' | Expire Date: '{}'".format(
+              col_int_nota, col_int_valor, col_int_venc))
+
+    # --- Padronizacao da chave e valores no fornecedor ---
+    df_forn = df_fornecedor.copy()
+    df_forn[COL_CHAVE] = df_forn[col_forn_nota].apply(padronizar_chave_nota)
+    df_forn["_valor_forn"] = df_forn[col_forn_valor].apply(converter_para_numero)
+    df_forn["_venc_forn"] = df_forn[col_forn_venc].apply(converter_para_data)
+
+    # --- Preparacao da base interna para o join ---
+    df_int = df_interna.copy()
+    df_int[COL_CHAVE] = df_int[col_int_nota].astype(str).str.strip()
+    df_int[COL_VALOR_INTERNO] = df_int[col_int_valor].apply(converter_para_numero)
+    df_int[COL_VENC_INTERNO] = df_int[col_int_venc].apply(converter_para_data)
+
+    # Mantem apenas as colunas necessarias da base interna e remove duplicatas
+    # de chave para evitar multiplicacao de linhas no Left Join.
+    df_int_reduzida = df_int[[COL_CHAVE, COL_VALOR_INTERNO, COL_VENC_INTERNO]]
+    df_int_reduzida = df_int_reduzida.drop_duplicates(subset=[COL_CHAVE], keep="first")
+
+    # --- Left Join pela chave padronizada ---
+    df_merged = df_forn.merge(df_int_reduzida, on=COL_CHAVE, how="left")
+
+    # --- Aplicacao dos criterios de elegibilidade ---
+    df_merged[COL_ELEGIVEL] = df_merged.apply(_avaliar_elegibilidade, axis=1)
+
+    # --- Colunas de auditoria (visiveis no arquivo final) ---
+    # Ajudam a entender o motivo de cada classificacao. Todos os valores e datas
+    # sao apresentados no mesmo formato, tanto para o fornecedor quanto para a
+    # base interna, para permitir comparacao direta.
+
+    # Normaliza a coluna de valor do fornecedor para o padrao brasileiro,
+    # sobrescrevendo o conteudo original para garantir formato uniforme.
+    df_merged[col_forn_valor] = df_merged["_valor_forn"].apply(_formatar_valor_br)
+
+    # Normaliza a coluna de vencimento do fornecedor para dd/mm/aaaa.
+    df_merged[col_forn_venc] = df_merged["_venc_forn"].apply(_formatar_data_br)
+
+    # Valor e vencimento da base interna, no mesmo formato do fornecedor.
+    df_merged[COL_AUD_VALOR_INTERNO] = df_merged[COL_VALOR_INTERNO].apply(
+        _formatar_valor_br)
+    df_merged[COL_AUD_VENC_INTERNO] = df_merged[COL_VENC_INTERNO].apply(
+        _formatar_data_br)
+
+    # Diferenca de valor (fornecedor menos interna), em numero.
+    df_merged[COL_AUD_DIF_VALOR] = df_merged.apply(
+        lambda linha: _calcular_diferenca_valor(
+            linha["_valor_forn"], linha[COL_VALOR_INTERNO]),
+        axis=1,
+    )
+
+    # Diferenca de dias (fornecedor menos interna), em numero inteiro.
+    df_merged[COL_AUD_DIF_DIAS] = df_merged.apply(
+        lambda linha: _calcular_diferenca_dias(
+            linha["_venc_forn"], linha[COL_VENC_INTERNO]),
+        axis=1,
+    )
+
+    # --- Traducao para o status textual ---
+    df_merged[COLUNA_STATUS] = df_merged[COL_ELEGIVEL].apply(
+        lambda apto: "Disponivel" if apto else "Nao Apta"
+    )
+
+    qtd_disponivel = int(df_merged[COL_ELEGIVEL].sum())
+    qtd_nao_apta = len(df_merged) - qtd_disponivel
+    print("Reconciliacao concluida -> Disponiveis: {} | Nao Aptas: {}".format(
+        qtd_disponivel, qtd_nao_apta))
+
+    return df_merged
+
+
+def _avaliar_elegibilidade(linha):
+    """
+    Avalia se uma linha atende simultaneamente aos dois criterios de
+    elegibilidade:
+        1. Valor exatamente igual ao Gross Amount da base interna.
+        2. Diferenca de vencimento de no maximo TOLERANCIA_DIAS_VENCIMENTO dias.
+
+    Se a nota nao teve correspondencia no Left Join (valores nulos vindos da
+    base interna), a nota e considerada nao apta.
+    """
+    valor_forn = linha.get("_valor_forn")
+    valor_interno = linha.get(COL_VALOR_INTERNO)
+    venc_forn = linha.get("_venc_forn")
+    venc_interno = linha.get(COL_VENC_INTERNO)
+
+    # Sem correspondencia na base interna
+    if pd.isna(valor_interno) or pd.isna(venc_interno):
+        return False
+    if valor_forn is None or pd.isna(valor_forn) or pd.isna(venc_forn):
+        return False
+
+    # Criterio de valor (igualdade exata com tolerancia minima de arredondamento)
+    criterio_valor = abs(float(valor_forn) - float(valor_interno)) < 0.005
+
+    # Criterio de vencimento (diferenca absoluta em dias)
+    diferenca_dias = abs((venc_forn - venc_interno).days)
+    criterio_vencimento = diferenca_dias <= TOLERANCIA_DIAS_VENCIMENTO
+
+    return bool(criterio_valor and criterio_vencimento)
+
+
+# ---------------------------------------------------------------------------
+# EXPORTACAO E FORMATACAO
+# ---------------------------------------------------------------------------
+
+def _normalizar_caminho_saida(caminho_saida):
+    """
+    Garante que o caminho de saida aponte para um arquivo .xlsx valido.
+
+    Trata dois casos comuns de erro de configuracao:
+        1. Caminho aponta para uma pasta existente: anexa o nome padrao dentro dela.
+        2. Caminho sem extensao ou com extensao diferente de .xlsx: ajusta para .xlsx.
+
+    Sem esse tratamento, o pandas nao consegue deduzir o motor de gravacao e
+    levanta OptionError ('io.excel..writer').
+    """
+    # Caso o caminho seja um diretorio existente, grava o arquivo padrao dentro
+    if os.path.isdir(caminho_saida):
+        return os.path.join(caminho_saida, NOME_ARQUIVO_SAIDA)
+
+    raiz, extensao = os.path.splitext(caminho_saida)
+
+    # Sem extensao ou extensao diferente de .xlsx: forca .xlsx
+    if extensao.lower() != ".xlsx":
+        return raiz + ".xlsx"
+
+    return caminho_saida
+
+
+def exportar_resultado(df_merged, df_fornecedor_original, caminho_saida):
+    """
+    Exporta o resultado final preservando o layout original do fornecedor,
+    ocultando as colunas internas de calculo, adicionando a coluna de status
+    e aplicando a formatacao visual das linhas nao aptas.
+    """
+    # Garante que o destino seja um arquivo .xlsx valido
+    caminho_saida = _normalizar_caminho_saida(caminho_saida)
+    print("Preparando arquivo de saida: {}".format(caminho_saida))
+
+    # Colunas originais do fornecedor, na ordem e com os nomes originais
+    colunas_originais = list(df_fornecedor_original.columns)
+
+    # Colunas de auditoria, inseridas entre as originais e o status. Permitem
+    # ao usuario identificar o motivo da classificacao (diferenca de valor e
+    # de dias), com valores e datas no mesmo formato do fornecedor.
+    colunas_auditoria = [
+        COL_AUD_VALOR_INTERNO,
+        COL_AUD_VENC_INTERNO,
+        COL_AUD_DIF_VALOR,
+        COL_AUD_DIF_DIAS,
+    ]
+
+    # DataFrame final: originais + auditoria + status
+    df_saida = df_merged[
+        colunas_originais + colunas_auditoria + [COLUNA_STATUS]
+    ].copy()
+
+    # Escreve o DataFrame no Excel usando explicitamente o motor openpyxl
+    df_saida.to_excel(caminho_saida, index=False, engine="openpyxl")
+
+    # Reabre com openpyxl para aplicar formatacao
+    workbook = load_workbook(caminho_saida)
+    worksheet = workbook.active
+
+    # Garante as linhas de grade visiveis
+    worksheet.sheet_view.showGridLines = True
+
+    # Indice (1-based) da coluna de status
+    indice_status = len(df_saida.columns)
+
+    # Aplica formatacao linha a linha (as linhas de dados comecam em 2)
+    for offset, elegivel in enumerate(df_merged[COL_ELEGIVEL].tolist()):
+        linha_excel = offset + 2  # +1 pelo cabecalho, +1 pelo 1-based
+
+        if not elegivel:
+            # Pinta a linha inteira de vermelho pastel
+            for coluna in range(1, indice_status + 1):
+                celula = worksheet.cell(row=linha_excel, column=coluna)
+                celula.fill = FILL_NAO_APTA
+
+            # Destaca o texto do status
+            celula_status = worksheet.cell(row=linha_excel, column=indice_status)
+            celula_status.font = FONT_STATUS_NAO_APTA
+
+    # Ajuste automatico de largura das colunas
+    _ajustar_largura_colunas(worksheet)
+
+    workbook.save(caminho_saida)
+    print("Arquivo gerado com sucesso: {}".format(caminho_saida))
+
+
+def gerar_aba_antecipar(caminho_saida, df_interna, chaves_disponiveis):
+    """
+    Adiciona ao arquivo de saida uma aba com apenas as notas disponiveis para
+    antecipar, no layout do cliente (colunas da base interna seguidas das
+    colunas calculadas), com formulas vivas do Excel.
+
+    Parametros:
+        caminho_saida: caminho do arquivo .xlsx ja existente (sera atualizado).
+        df_interna: DataFrame bruto da base interna corporativa.
+        chaves_disponiveis: conjunto de chaves padronizadas (Fiscal Note) das
+                            notas classificadas como disponiveis.
+
+    Regras de negocio das colunas calculadas (por linha, exemplo linha 2):
+        Payment Date Customer (N) = data de hoje (data real do Excel).
+        Anticipation (O)          = a propria Fiscal Note (coluna D).
+        Customer Net Amount (P)   = Gross Amount menos Other Deductions (=F2-M2).
+        Days Before Due Date (Q)  = =IF(K2<>"";K2-N2;IF(OR(L2="";L2<I2);
+                                       H2-N2;L2+(H2-I2)-N2))
+        Normal Discount (R)       = =ROUND((J2/30)*Q2/100*P2;2)
+        Amount with Cash Discount (S) = =ROUND(P2-R2;2)
+    """
+    print("Gerando aba '{}' com notas disponiveis...".format(NOME_ABA_ANTECIPAR))
+
+    # Localiza a coluna de Fiscal Note na base interna para filtrar as notas
+    col_int_nota = localizar_coluna(df_interna.columns, ["fiscal", "note"])
+
+    # Filtra apenas as linhas cujas notas estao disponiveis para antecipar
+    chave_interna = df_interna[col_int_nota].astype(str).str.strip()
+    df_disponiveis = df_interna[chave_interna.isin(chaves_disponiveis)].copy()
+    df_disponiveis = df_disponiveis.reset_index(drop=True)
+
+    print("Notas disponiveis para a aba: {}".format(len(df_disponiveis)))
+
+    # Abre o arquivo ja existente para acrescentar a nova aba
+    workbook = load_workbook(caminho_saida)
+
+    # Remove a aba se ja existir (execucoes repetidas)
+    if NOME_ABA_ANTECIPAR in workbook.sheetnames:
+        del workbook[NOME_ABA_ANTECIPAR]
+
+    worksheet = workbook.create_sheet(title=NOME_ABA_ANTECIPAR)
+    worksheet.sheet_view.showGridLines = True
+
+    # --- Cabecalhos: colunas originais da base interna + calculadas ---
+    colunas_internas = list(df_disponiveis.columns)
+    cabecalhos = colunas_internas + CABECALHOS_CALCULADOS
+    worksheet.append(cabecalhos)
+
+    # Indices (1-based) das colunas que as formulas referenciam. Sao calculados
+    # dinamicamente a partir das colunas detectadas, para nao depender de
+    # posicoes fixas caso a base interna mude a ordem.
+    col_gross = _indice_coluna_por_termo(colunas_internas, ["gross", "amount"])
+    col_expire = _indice_coluna_por_termo(colunas_internas, ["expire", "date"])
+    col_delivery = _indice_coluna_por_termo(colunas_internas, ["delivery", "date"])
+    col_normal = _indice_coluna_por_termo(colunas_internas, ["normal"])
+    col_due = _indice_coluna_por_termo(colunas_internas, ["due", "date"])
+    col_cust_delivery = _indice_coluna_por_termo(
+        colunas_internas, ["customer", "delivery"])
+    col_other_ded = _indice_coluna_por_termo(colunas_internas, ["other", "deduction"])
+    col_fiscal = _indice_coluna_por_termo(colunas_internas, ["fiscal", "note"])
+
+    # Posicoes (1-based) das colunas calculadas
+    n_internas = len(colunas_internas)
+    pos_pay = n_internas + 1        # Payment Date Customer
+    pos_antic = n_internas + 2      # Anticipation
+    pos_net = n_internas + 3        # Customer Net Amount
+    pos_days = n_internas + 4       # Days Before Due Date
+    pos_disc = n_internas + 5       # Normal Discount
+    pos_cash = n_internas + 6       # Amount with Cash Discount
+
+    letra_gross = get_column_letter(col_gross)
+    letra_expire = get_column_letter(col_expire)
+    letra_delivery = get_column_letter(col_delivery)
+    letra_normal = get_column_letter(col_normal)
+    letra_due = get_column_letter(col_due)
+    letra_cust_delivery = get_column_letter(col_cust_delivery)
+    letra_other_ded = get_column_letter(col_other_ded)
+    letra_fiscal = get_column_letter(col_fiscal)
+    letra_pay = get_column_letter(pos_pay)
+    letra_net = get_column_letter(pos_net)
+    letra_days = get_column_letter(pos_days)
+    letra_disc = get_column_letter(pos_disc)
+
+    # Data de hoje, como data real do Excel
+    data_hoje = pd.Timestamp.today().normalize().to_pydatetime()
+
+    # --- Escrita das linhas ---
+    for i in range(len(df_disponiveis)):
+        linha_excel = i + 2  # +1 cabecalho, +1 base 1
+
+        # Escreve as colunas originais da base interna
+        for j, coluna in enumerate(colunas_internas):
+            valor = df_disponiveis.iloc[i][coluna]
+            celula = worksheet.cell(row=linha_excel, column=j + 1)
+            celula.value = _converter_celula_interna(valor, coluna)
+
+        L = linha_excel  # atalho para montar as formulas
+
+        # Payment Date Customer: data de hoje (data real)
+        cel_pay = worksheet.cell(row=L, column=pos_pay)
+        cel_pay.value = data_hoje
+        cel_pay.number_format = "DD/MM/YYYY"
+
+        # Anticipation: a propria Fiscal Note
+        worksheet.cell(row=L, column=pos_antic).value = (
+            "={}{}".format(letra_fiscal, L))
+
+        # Customer Net Amount = Gross Amount - Other Deductions
+        worksheet.cell(row=L, column=pos_net).value = (
+            "={}{}-{}{}".format(letra_gross, L, letra_other_ded, L))
+
+        # Days Before Due Date (formula do cliente).
+        # O openpyxl grava formulas no padrao internacional, que usa virgula
+        # como separador de argumentos. O Excel exibe automaticamente com o
+        # separador local (ponto e virgula em PT-BR) ao abrir o arquivo.
+        formula_days = (
+            "=IF({due}{L}<>\"\",{due}{L}-{pay}{L},"
+            "IF(OR({cd}{L}=\"\",{cd}{L}<{dl}{L}),"
+            "{ex}{L}-{pay}{L},"
+            "{cd}{L}+({ex}{L}-{dl}{L})-{pay}{L}))"
+        ).format(
+            due=letra_due, cd=letra_cust_delivery, dl=letra_delivery,
+            ex=letra_expire, pay=letra_pay, L=L,
+        )
+        worksheet.cell(row=L, column=pos_days).value = formula_days
+
+        # Normal Discount = ROUND((J/30)*Q/100*P;2)
+        worksheet.cell(row=L, column=pos_disc).value = (
+            "=ROUND(({normal}{L}/30)*{days}{L}/100*{net}{L},2)".format(
+                normal=letra_normal, days=letra_days, net=letra_net, L=L))
+
+        # Amount with Cash Discount = ROUND(P - R;2)
+        worksheet.cell(row=L, column=pos_cash).value = (
+            "=ROUND({net}{L}-{disc}{L},2)".format(
+                net=letra_net, disc=letra_disc, L=L))
+
+    _ajustar_largura_colunas(worksheet)
+    workbook.save(caminho_saida)
+    print("Aba '{}' gerada com sucesso.".format(NOME_ABA_ANTECIPAR))
+
+
+def _indice_coluna_por_termo(colunas, termos):
+    """
+    Retorna o indice 1-based da coluna que corresponde aos termos informados.
+    Levanta KeyError se nenhuma coluna casar, pois a formula depende dela.
+    """
+    nome = localizar_coluna(colunas, termos)
+    if nome is None:
+        raise KeyError(
+            "Coluna necessaria para as formulas nao encontrada: {}. "
+            "Colunas disponiveis: {}".format(termos, list(colunas)))
+    return list(colunas).index(nome) + 1
+
+
+def _converter_celula_interna(valor, nome_coluna):
+    """
+    Converte um valor da base interna para o tipo adequado ao escrever na aba:
+        - Colunas de data viram datas reais do Excel.
+        - Colunas numericas (valores monetarios) viram float.
+        - Demais colunas permanecem como texto.
+
+    Isso garante que as formulas (diferenca de datas, calculo de desconto)
+    operem sobre tipos corretos, e nao sobre texto.
+    """
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+
+    nome_norm = _normalizar_texto(nome_coluna)
+
+    # Colunas de data
+    termos_data = ["posting", "expire", "delivery", "due date", "payment date"]
+    if any(t in nome_norm for t in termos_data):
+        data = converter_para_data(valor)
+        if pd.notna(data):
+            return data.to_pydatetime()
+        return None
+
+    # Colunas numericas de valor
+    termos_valor = ["gross amount", "amount", "deduction", "normal", "net"]
+    if any(t in nome_norm for t in termos_valor):
+        numero = converter_para_numero(valor)
+        if numero is not None:
+            return numero
+        return None
+
+    # Demais colunas: texto
+    return str(valor).strip()
+
+
+def _ajustar_largura_colunas(worksheet):
+    """
+    Ajusta a largura de cada coluna com base no maior conteudo, evitando
+    textos cortados e a exibicao de '###' em celulas numericas ou de data.
+    """
+    for coluna_celulas in worksheet.columns:
+        largura_maxima = 0
+        letra_coluna = get_column_letter(coluna_celulas[0].column)
+
+        for celula in coluna_celulas:
+            if celula.value is not None:
+                comprimento = len(str(celula.value))
+                if comprimento > largura_maxima:
+                    largura_maxima = comprimento
+
+        # Adiciona uma folga e limita a um teto razoavel
+        largura_ajustada = min(largura_maxima + 3, 60)
+        worksheet.column_dimensions[letra_coluna].width = largura_ajustada
+
+
+# ---------------------------------------------------------------------------
+# ORQUESTRACAO
+# ---------------------------------------------------------------------------
+
+def executar_processo(caminho_fornecedor, caminho_interna, caminho_saida):
+    """
+    Orquestra o fluxo completo: leitura, reconciliacao e exportacao.
+    """
+    print("=" * 70)
+    print("PROCESSO DE SINALIZACAO DE ANTECIPACAO - INICIO")
+    print("=" * 70)
+
+    df_fornecedor = ler_base_fornecedor(caminho_fornecedor)
+    df_interna = ler_base_interna(caminho_interna)
+
+    df_merged = reconciliar(df_fornecedor, df_interna)
+
+    exportar_resultado(df_merged, df_fornecedor, caminho_saida)
+
+    # Extrai as chaves das notas disponiveis e gera a aba de antecipacao
+    disponiveis = df_merged[df_merged[COL_ELEGIVEL]]
+    chaves_disponiveis = set(disponiveis[COL_CHAVE].tolist())
+    caminho_final = _normalizar_caminho_saida(caminho_saida)
+    gerar_aba_antecipar(caminho_final, df_interna, chaves_disponiveis)
+
+    print("=" * 70)
+    print("PROCESSO CONCLUIDO")
+    print("=" * 70)
+
+
+def main():
+    """
+    Ponto de entrada. Ajuste os caminhos abaixo conforme o ambiente.
+    """
+    # CONFIG: ajuste os caminhos de entrada e saida
+    CAMINHO_FORNECEDOR = "planilha_fornecedor.xlsx"
+    CAMINHO_INTERNA = "base_interna.xlsx"
+    CAMINHO_SAIDA = NOME_ARQUIVO_SAIDA
+
+    if not os.path.exists(CAMINHO_FORNECEDOR):
+        print("ERRO: arquivo do fornecedor nao encontrado em '{}'".format(
+            CAMINHO_FORNECEDOR))
+        return
+    if not os.path.exists(CAMINHO_INTERNA):
+        print("ERRO: base interna nao encontrada em '{}'".format(
+            CAMINHO_INTERNA))
+        return
+
+    executar_processo(CAMINHO_FORNECEDOR, CAMINHO_INTERNA, CAMINHO_SAIDA)
+
+
+if __name__ == "__main__":
+    main()
