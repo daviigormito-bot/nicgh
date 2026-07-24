@@ -1,0 +1,501 @@
+"""
+Cruzamento Base_Srm_Modelo x sellin com dashboard interativo.
+Filtros de Customer e Mes recalculam as medidas no navegador.
+
+Uso:
+    pip install pandas openpyxl
+    python dsrm_v2.py
+"""
+
+import pandas as pd
+import numpy as np
+import shutil
+import os
+import tempfile
+
+
+# ---------------------------------------------------------------
+# CONFIGURACAO
+# ---------------------------------------------------------------
+
+CAMINHO_VENDAS = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\SRM_Dashboard\Base_Srm_Modelo.xlsx"
+CAMINHO_SELL = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\sellin - Copy (2).xlsx"
+
+ABA_VENDAS = 0
+ABA_SELL = "tbsell"
+ANO_ATUAL = 2026
+
+MAPA_COLUNAS = {
+    "Categoria SAP": "Category SAP",
+    "Categoria Sap": "Category SAP",
+    "CATEGORIA SAP": "Category SAP",
+    "categoria sap": "Category SAP",
+    "Subcategoria": "SUB",
+    "SubCategoria": "SUB",
+    "Cliente": "Customer",
+    "CLIENTE": "Customer",
+    "Mes": "Mês",
+    "MES": "Mês",
+}
+
+MESES_NOME = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
+              7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
+
+
+# ---------------------------------------------------------------
+# Leitura e limpeza
+# ---------------------------------------------------------------
+
+def ler_excel(caminho, aba):
+    try:
+        return pd.read_excel(caminho, sheet_name=aba)
+    except (PermissionError, OSError):
+        destino = os.path.join(tempfile.gettempdir(), os.path.basename(caminho))
+        shutil.copy2(caminho, destino)
+        print(f"  aviso: arquivo travado, lendo copia em {destino}")
+        return pd.read_excel(destino, sheet_name=aba)
+
+
+def padronizar_colunas(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    existentes = set(df.columns)
+    mapa_seguro = {}
+    for origem, destino in MAPA_COLUNAS.items():
+        if origem in existentes and destino not in existentes:
+            mapa_seguro[origem] = destino
+            existentes.add(destino)
+    return df.rename(columns=mapa_seguro)
+
+
+def resolver_duplicatas(df, nome_base=""):
+    dups = df.columns[df.columns.duplicated()].unique()
+    if len(dups):
+        print(f"  aviso ({nome_base}): colunas duplicadas removidas: {list(dups)}")
+    return df.loc[:, ~df.columns.duplicated()]
+
+
+def normalizar_chave(serie):
+    if isinstance(serie, pd.DataFrame):
+        serie = serie.iloc[:, 0]
+    return (
+        serie.astype(str).str.strip().str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.normalize("NFKD").str.encode("ascii", errors="ignore").str.decode("utf-8")
+    )
+
+
+def preparar_chaves(df):
+    df = df.copy()
+    df["_cat"] = normalizar_chave(df["Category SAP"])
+    df["_sub"] = normalizar_chave(df["SUB"])
+    df["_cust"] = normalizar_chave(df["Customer"])
+    return df
+
+
+def preparar_periodo(df, col_data=None, col_ano=None, col_mes=None):
+    df = df.copy()
+    if col_data is not None:
+        col = df[col_data]
+        if pd.api.types.is_datetime64_any_dtype(col):
+            data = col
+        else:
+            # Detecta o formato pelo separador: ISO (2024-01-15) nao usa
+            # dayfirst; brasileiro (15/01/2024) usa. Forcar dayfirst num
+            # texto ISO troca dia e mes.
+            amostra = col.dropna().astype(str).head(20)
+            usa_dayfirst = amostra.str.contains("/").any()
+            data = pd.to_datetime(col, errors="coerce", dayfirst=usa_dayfirst)
+        df["_ano"] = data.dt.year
+        df["_mes"] = data.dt.month
+    else:
+        df["_ano"] = pd.to_numeric(df[col_ano], errors="coerce")
+        df["_mes"] = pd.to_numeric(df[col_mes], errors="coerce")
+    df["_ano"] = df["_ano"].astype("Int64")
+    df["_mes"] = df["_mes"].astype("Int64")
+    return df
+
+
+# Chave inclui Customer e Mes para permitir filtro no navegador.
+CHAVES = ["_cust", "_cat", "_sub", "_ano", "_mes"]
+
+
+# ---------------------------------------------------------------
+# Agregacao mantendo Customer e Mes
+# ---------------------------------------------------------------
+
+def agregar_vendas(df, col_valor="Valor", col_su="SU"):
+    return (
+        df.groupby(CHAVES, dropna=False)
+        .agg(faturamento=(col_valor, "sum"), su=(col_su, "sum"))
+        .reset_index()
+    )
+
+
+def agregar_sell(df):
+    candidatas = ["MSU", "Valor"]
+    presentes = [c for c in candidatas if c in df.columns]
+    mapa = {f"sell_{c}": (c, "sum") for c in presentes}
+    return df.groupby(CHAVES, dropna=False).agg(**mapa).reset_index()
+
+
+def cruzar(vendas_agg, sell_agg):
+    merged = vendas_agg.merge(sell_agg, on=CHAVES, how="outer", indicator=True)
+    diag = {
+        "casaram": int((merged["_merge"] == "both").sum()),
+        "so_vendas": int((merged["_merge"] == "left_only").sum()),
+        "so_sell": int((merged["_merge"] == "right_only").sum()),
+    }
+    total = sum(diag.values())
+    diag["pct_casou"] = round(diag["casaram"] / total * 100, 1) if total else 0
+    return merged, diag
+
+
+def comparar_dominios(vendas, sell, coluna="_cat"):
+    a = set(vendas[coluna].dropna().unique())
+    b = set(sell[coluna].dropna().unique())
+    return {"so_em_vendas": sorted(a - b), "so_em_sell": sorted(b - a), "em_ambas": sorted(a & b)}
+
+
+# ---------------------------------------------------------------
+# Preparacao dos dados para o navegador
+# ---------------------------------------------------------------
+
+def preparar_dados_dashboard(merged, ano_atual):
+    """
+    Exporta linhas detalhadas (Customer + Mes + Categoria) com valores do ano
+    atual e do anterior, para o navegador recalcular sob os filtros.
+    """
+    at = merged[merged["_ano"] == ano_atual].copy()
+    an = merged[merged["_ano"] == ano_atual - 1].copy()
+
+    chave_ant = ["_cust", "_mes", "_cat"]
+    ant = an.groupby(chave_ant, dropna=False).agg(
+        fat_ant=("faturamento", "sum"), su_ant=("su", "sum")
+    ).reset_index()
+
+    at = at.groupby(["_cust", "_mes", "_cat"], dropna=False).agg(
+        fat=("faturamento", "sum"),
+        su=("su", "sum"),
+        msu=("sell_MSU", "sum") if "sell_MSU" in merged.columns else ("faturamento", "size"),
+        valor_sell=("sell_Valor", "sum") if "sell_Valor" in merged.columns else ("faturamento", "size"),
+    ).reset_index()
+
+    dados = at.merge(ant, on=chave_ant, how="left")
+    dados["mes_nome"] = dados["_mes"].map(lambda m: MESES_NOME.get(int(m), str(m)) if pd.notna(m) else "?")
+
+    registros = []
+    for _, r in dados.iterrows():
+        registros.append({
+            "customer": r["_cust"],
+            "mes": int(r["_mes"]) if pd.notna(r["_mes"]) else 0,
+            "mesNome": r["mes_nome"],
+            "cat": r["_cat"],
+            "fat": float(r["fat"]) if pd.notna(r["fat"]) else 0,
+            "su": float(r["su"]) if pd.notna(r["su"]) else 0,
+            "msu": float(r["msu"]) if pd.notna(r["msu"]) else 0,
+            "valorSell": float(r["valor_sell"]) if pd.notna(r["valor_sell"]) else 0,
+            "fatAnt": float(r["fat_ant"]) if pd.notna(r["fat_ant"]) else 0,
+            "suAnt": float(r["su_ant"]) if pd.notna(r["su_ant"]) else 0,
+        })
+    return registros
+
+
+# ---------------------------------------------------------------
+# Dashboard HTML com filtros
+# ---------------------------------------------------------------
+
+def gerar_dashboard_html(registros, diag, dominios, arquivo="dashboard_srm.html"):
+    import json
+    dados = json.dumps(registros, ensure_ascii=False)
+    diag_j = json.dumps(diag, ensure_ascii=False)
+    orfas = json.dumps({
+        "soVendas": dominios["so_em_vendas"],
+        "soSell": dominios["so_em_sell"],
+    }, ensure_ascii=False)
+
+    html = r"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>SRM - sell-out x sell-in</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #faf8f4;
+         color: #1a1714; margin: 0; padding: 28px 26px 44px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .sobrancelha { font-family: Consolas, monospace; font-size: 11px;
+                 letter-spacing: 0.14em; text-transform: uppercase;
+                 color: #7a736b; margin-bottom: 8px; }
+  .sub { font-size: 13.5px; color: #5c554d; margin: 0; }
+  header { border-bottom: 2px solid #1a1714; padding-bottom: 16px;
+           margin-bottom: 20px; display: flex; justify-content: space-between;
+           align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+  .badge { font-family: Consolas, monospace; font-size: 12px; font-weight: 600;
+           color: #fff; border: none; padding: 9px 15px; cursor: pointer; }
+  .filtros { display: flex; gap: 28px; flex-wrap: wrap; margin-bottom: 22px; }
+  .rot-filtro { font-family: Consolas, monospace; font-size: 10.5px;
+                text-transform: uppercase; letter-spacing: 0.1em;
+                color: #7a736b; margin-bottom: 8px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 13px; padding: 7px 14px; border: 1px solid #c9c0b4;
+          background: #fff; cursor: pointer; user-select: none; transition: all 0.12s; }
+  .chip:hover { border-color: #1f5f7a; }
+  .chip.ativo { background: #1a1714; color: #fff; border-color: #1a1714; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr));
+          gap: 1px; background: #ddd6cc; border: 1px solid #ddd6cc; margin-bottom: 24px; }
+  .kpi { background: #fff; padding: 15px 18px; }
+  .kpi-rot { font-family: Consolas, monospace; font-size: 10px;
+             text-transform: uppercase; letter-spacing: 0.1em; color: #7a736b; margin-bottom: 6px; }
+  .kpi-val { font-size: 23px; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+          background: #fff; border: 1px solid #ddd6cc; }
+  th { font-family: Consolas, monospace; font-size: 10px; font-weight: 600;
+       text-transform: uppercase; letter-spacing: 0.06em; color: #5c554d;
+       text-align: right; padding: 11px 13px; border-bottom: 2px solid #1a1714; white-space: nowrap; }
+  th:first-child { text-align: left; }
+  td { padding: 9px 13px; text-align: right; font-family: Consolas, monospace;
+       font-variant-numeric: tabular-nums; border-bottom: 1px solid #eee9e1; white-space: nowrap; }
+  td:first-child { text-align: left; font-family: 'Segoe UI', sans-serif; font-weight: 500; }
+  tr:hover td { background: #f7f4ef; }
+  .sell { background: #f8f6f1; color: #1f5f7a; }
+  th.sell { background: #f2efe8; color: #1f5f7a; }
+  .total td { border-top: 2px solid #1a1714; font-weight: 700; background: #f7f4ef; }
+  #diag { background: #fff; border: 1px solid #ddd6cc; border-left: 3px solid #8a3324;
+          padding: 16px 20px; margin-bottom: 22px; display: none; }
+  #diag h2 { font-size: 15px; margin: 0 0 10px; }
+  .grid-diag { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap: 22px; }
+  .rot-diag { font-family: Consolas, monospace; font-size: 11px; text-transform: uppercase;
+              letter-spacing: 0.1em; color: #7a736b; margin-bottom: 8px; padding-bottom: 6px;
+              border-bottom: 1px solid #e5ded4; }
+  .orfa { font-family: Consolas, monospace; font-size: 12.5px; padding: 3px 0; }
+  .rodape { font-size: 12px; color: #7a736b; margin-top: 16px; line-height: 1.6; max-width: 680px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="sobrancelha">Base_Srm_Modelo &times; sellin</div>
+    <h1>Sell-out e sell-in lado a lado</h1>
+    <p class="sub">Clique nos filtros para recalcular. SRM, preco medio, faturamento, BZ% e MSU por categoria.</p>
+  </div>
+  <button class="badge" id="btn-diag" onclick="alternarDiag()"></button>
+</header>
+
+<div id="diag">
+  <h2>Diagnostico do cruzamento</h2>
+  <div id="diag-num"></div>
+  <div class="grid-diag" style="margin-top:14px">
+    <div><div class="rot-diag">Category SAP so em Base_Srm_Modelo</div><div id="orfa-v"></div></div>
+    <div><div class="rot-diag">Category SAP so em sellin</div><div id="orfa-s"></div></div>
+  </div>
+</div>
+
+<div class="filtros">
+  <div>
+    <div class="rot-filtro">Customer</div>
+    <div class="chips" id="filtro-customer"></div>
+  </div>
+  <div>
+    <div class="rot-filtro">Mes</div>
+    <div class="chips" id="filtro-mes"></div>
+  </div>
+</div>
+
+<div class="kpis" id="kpis"></div>
+<table id="tabela"></table>
+<p class="rodape">Colunas em azul vem do sellin. SRM = indice de valor menos indice de SU,
+ambos contra o ano anterior. BZ% usa o total do escopo filtrado como denominador.</p>
+
+<script>
+const DADOS = __DADOS__;
+const DIAG = __DIAG__;
+const ORFAS = __ORFAS__;
+
+let fCustomer = "TODOS";
+let fMes = "TODOS";
+
+const moeda = v => (v == null || isNaN(v)) ? "\u2014" : "R$ " + Math.round(v).toLocaleString("pt-BR");
+const num = (v, c = 2) => (v == null || isNaN(v)) ? "\u2014" :
+  v.toLocaleString("pt-BR", {minimumFractionDigits: c, maximumFractionDigits: c});
+
+function corSRM(srm) {
+  if (srm == null || isNaN(srm)) return "";
+  const i = Math.min(Math.abs(srm) / 20, 1);
+  const a = (0.15 + i * 0.75).toFixed(2);
+  const fg = i > 0.45 ? "#fff" : (srm >= 0 ? "#123f2e" : "#5c1616");
+  const bg = srm >= 0 ? "rgba(31,122,90," + a + ")" : "rgba(176,48,48," + a + ")";
+  return "background:" + bg + ";color:" + fg + ";font-weight:600";
+}
+
+function filtrar() {
+  return DADOS.filter(d =>
+    (fCustomer === "TODOS" || d.customer === fCustomer) &&
+    (fMes === "TODOS" || d.mesNome === fMes));
+}
+
+function agregarPorCategoria(linhas) {
+  const mapa = new Map();
+  for (const l of linhas) {
+    if (!mapa.has(l.cat)) mapa.set(l.cat, {cat: l.cat, fat:0, su:0, msu:0, valorSell:0, fatAnt:0, suAnt:0});
+    const a = mapa.get(l.cat);
+    a.fat += l.fat; a.su += l.su; a.msu += l.msu;
+    a.valorSell += l.valorSell; a.fatAnt += l.fatAnt; a.suAnt += l.suAnt;
+  }
+  return [...mapa.values()];
+}
+
+function medidas(a, totalFat) {
+  const precoMedio = a.su ? a.fat / a.su : null;
+  const iValor = a.fatAnt ? (a.fat / a.fatAnt) * 100 : null;
+  const iSU = a.suAnt ? (a.su / a.suAnt) * 100 : null;
+  const srm = (iValor != null && iSU != null) ? iValor - iSU : null;
+  const bz = totalFat ? (a.fat / totalFat) * 100 : null;
+  return {precoMedio, srm, bz};
+}
+
+function render() {
+  const linhas = filtrar();
+  const cats = agregarPorCategoria(linhas).sort((x, y) => y.fat - x.fat);
+  const totalFat = cats.reduce((s, c) => s + c.fat, 0);
+  const totalSU = cats.reduce((s, c) => s + c.su, 0);
+  const totalMSU = cats.reduce((s, c) => s + c.msu, 0);
+  const totalValorSell = cats.reduce((s, c) => s + c.valorSell, 0);
+  const totalFatAnt = cats.reduce((s, c) => s + c.fatAnt, 0);
+  const totalSUAnt = cats.reduce((s, c) => s + c.suAnt, 0);
+  const srmTotal = (totalFatAnt && totalSUAnt)
+    ? (totalFat/totalFatAnt)*100 - (totalSU/totalSUAnt)*100 : null;
+
+  document.getElementById("kpis").innerHTML = [
+    ["Faturamento", moeda(totalFat)],
+    ["Preco medio SU", num(totalSU ? totalFat/totalSU : null)],
+    ["SRM", num(srmTotal)],
+    ["MSU sell-in", num(totalMSU, 1)]
+  ].map(p => '<div class="kpi"><div class="kpi-rot">'+p[0]+'</div><div class="kpi-val">'+p[1]+'</div></div>').join("");
+
+  let corpo = cats.map(c => {
+    const m = medidas(c, totalFat);
+    return '<tr><td>'+c.cat+'</td>' +
+      '<td style="'+corSRM(m.srm)+'">'+num(m.srm)+'</td>' +
+      '<td>'+num(m.precoMedio)+'</td>' +
+      '<td>'+moeda(c.fat)+'</td>' +
+      '<td>'+num(m.bz)+'%</td>' +
+      '<td class="sell">'+num(c.msu,1)+'</td>' +
+      '<td class="sell">'+moeda(c.valorSell)+'</td></tr>';
+  }).join("");
+
+  const total = '<tr class="total"><td>Total</td><td>'+num(srmTotal)+'</td>' +
+    '<td>'+num(totalSU ? totalFat/totalSU : null)+'</td>' +
+    '<td>'+moeda(totalFat)+'</td><td>100,00%</td>' +
+    '<td class="sell">'+num(totalMSU,1)+'</td>' +
+    '<td class="sell">'+moeda(totalValorSell)+'</td></tr>';
+
+  document.getElementById("tabela").innerHTML =
+    '<thead><tr><th>Category SAP</th><th>SRM</th><th>Preco medio SU</th>' +
+    '<th>Faturamento</th><th>BZ%</th><th class="sell">MSU</th>' +
+    '<th class="sell">Valor sell-in</th></tr></thead><tbody>' + corpo + total + '</tbody>';
+}
+
+function montarFiltros() {
+  const customers = ["TODOS", ...new Set(DADOS.map(d => d.customer))];
+  const meses = ["TODOS", ...[...new Set(DADOS.map(d => d.mes))].sort((a,b)=>a-b)
+    .map(mm => DADOS.find(d => d.mes === mm).mesNome)];
+
+  const cC = document.getElementById("filtro-customer");
+  cC.innerHTML = customers.map(c =>
+    '<span class="chip'+(c===fCustomer?' ativo':'')+'" data-v="'+c+'">'+c+'</span>').join("");
+  cC.querySelectorAll(".chip").forEach(ch => ch.onclick = () => {
+    fCustomer = ch.dataset.v; montarFiltros(); render();
+  });
+
+  const cM = document.getElementById("filtro-mes");
+  cM.innerHTML = meses.map(mm =>
+    '<span class="chip'+(mm===fMes?' ativo':'')+'" data-v="'+mm+'">'+mm+'</span>').join("");
+  cM.querySelectorAll(".chip").forEach(ch => ch.onclick = () => {
+    fMes = ch.dataset.v; montarFiltros(); render();
+  });
+}
+
+const nOrfas = ORFAS.soVendas.length + ORFAS.soSell.length;
+const btn = document.getElementById("btn-diag");
+btn.textContent = nOrfas + " categorias sem par";
+btn.style.background = nOrfas ? "#8a3324" : "#1f5f4a";
+document.getElementById("diag-num").innerHTML = Object.keys(DIAG)
+  .map(k => '<div class="orfa"><strong>'+k+'</strong>: '+DIAG[k]+'</div>').join("");
+document.getElementById("orfa-v").innerHTML =
+  ORFAS.soVendas.map(c => '<div class="orfa">'+c+'</div>').join("") || '<div class="orfa">nenhuma</div>';
+document.getElementById("orfa-s").innerHTML =
+  ORFAS.soSell.map(c => '<div class="orfa">'+c+'</div>').join("") || '<div class="orfa">nenhuma</div>';
+function alternarDiag(){const d=document.getElementById("diag");d.style.display=d.style.display==="block"?"none":"block";}
+
+montarFiltros();
+render();
+</script>
+</body>
+</html>"""
+
+    html = (html.replace("__DADOS__", dados)
+            .replace("__DIAG__", diag_j)
+            .replace("__ORFAS__", orfas))
+
+    caminho = os.path.abspath(arquivo)
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(html)
+    return caminho
+
+
+# ---------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------
+
+def executar():
+    print("Lendo Base_Srm_Modelo...")
+    vendas = resolver_duplicatas(padronizar_colunas(ler_excel(CAMINHO_VENDAS, ABA_VENDAS)), "Base_Srm_Modelo")
+    print("Lendo sellin...")
+    sell = resolver_duplicatas(padronizar_colunas(ler_excel(CAMINHO_SELL, ABA_SELL)), "sellin")
+
+    print("\nCOLUNAS Base_Srm_Modelo:", list(vendas.columns))
+    print("COLUNAS sellin:", list(sell.columns))
+
+    for nome, df in [("Base_Srm_Modelo", vendas), ("sellin", sell)]:
+        faltando = [c for c in ["Category SAP", "SUB", "Customer"] if c not in df.columns]
+        if faltando:
+            print(f"\nERRO: {nome} sem colunas {faltando}. Adicione ao MAPA_COLUNAS.")
+            return None
+
+    vendas = preparar_chaves(vendas)
+    sell = preparar_chaves(sell)
+
+    if "Data" in vendas.columns:
+        vendas = preparar_periodo(vendas, col_data="Data")
+    else:
+        vendas = preparar_periodo(vendas, col_ano="Ano", col_mes="Mês")
+    if "Ano" in sell.columns and "Mês" in sell.columns:
+        sell = preparar_periodo(sell, col_ano="Ano", col_mes="Mês")
+    else:
+        sell = preparar_periodo(sell, col_data="Data")
+
+    dominios = comparar_dominios(vendas, sell)
+    merged, diag = cruzar(agregar_vendas(vendas), agregar_sell(sell))
+
+    print("\n" + "=" * 60)
+    print("DIAGNOSTICO DO MERGE")
+    print("=" * 60)
+    for k, v in diag.items():
+        print(f"  {k}: {v}")
+    print(f"\nCATEGORY SAP so em Base_Srm_Modelo: {dominios['so_em_vendas'][:30]}")
+    print(f"CATEGORY SAP so em sellin: {dominios['so_em_sell'][:30]}")
+    print(f"CATEGORY SAP em ambas: {dominios['em_ambas'][:30]}")
+
+    registros = preparar_dados_dashboard(merged, ANO_ATUAL)
+    caminho = gerar_dashboard_html(registros, diag, dominios)
+
+    print("\n" + "=" * 60)
+    print("ARQUIVOS GERADOS")
+    print("=" * 60)
+    print(f"  Dashboard: {caminho}")
+    print("\nNo terminal, digite:  start dashboard_srm.html")
+
+
+if __name__ == "__main__":
+    executar()
