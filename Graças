@@ -1,0 +1,539 @@
+"""
+Cruzamento Base_Srm_Modelo x sellin, medidas DAX do projeto dsrm e
+geracao de dashboard HTML que abre no navegador.
+
+Uso:
+    pip install pandas openpyxl
+    python dsrm_merge.py
+"""
+
+import pandas as pd
+import numpy as np
+import shutil
+import os
+import tempfile
+
+
+# ---------------------------------------------------------------
+# CONFIGURACAO - ajuste apenas esta secao
+# ---------------------------------------------------------------
+
+CAMINHO_VENDAS = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\SRM_Dashboard\Base_Srm_Modelo.xlsx"
+CAMINHO_SELL = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\sellin - Copy (2).xlsx"
+
+ABA_VENDAS = 0
+ABA_SELL = "tbsell"
+
+ANO_ATUAL = 2026
+
+# Variacoes de nome de coluna que devem virar um nome unico.
+MAPA_COLUNAS = {
+    "Categoria SAP": "Category SAP",
+    "Categoria Sap": "Category SAP",
+    "CATEGORIA SAP": "Category SAP",
+    "categoria sap": "Category SAP",
+    "Subcategoria": "SUB",
+    "SubCategoria": "SUB",
+    "Cliente": "Customer",
+    "CLIENTE": "Customer",
+    "Mes": "Mês",
+    "MES": "Mês",
+}
+
+
+# ---------------------------------------------------------------
+# Leitura e limpeza de colunas
+# ---------------------------------------------------------------
+
+def ler_excel(caminho, aba):
+    """Le o Excel. Se estiver travado pelo OneDrive, copia para temp."""
+    try:
+        return pd.read_excel(caminho, sheet_name=aba)
+    except (PermissionError, OSError):
+        destino = os.path.join(tempfile.gettempdir(), os.path.basename(caminho))
+        shutil.copy2(caminho, destino)
+        print(f"  aviso: arquivo travado, lendo copia em {destino}")
+        return pd.read_excel(destino, sheet_name=aba)
+
+
+def padronizar_colunas(df):
+    """
+    Unifica variacoes de nome de coluna.
+    So renomeia se o destino ainda nao existir, para nao criar duplicata.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    existentes = set(df.columns)
+
+    mapa_seguro = {}
+    for origem, destino in MAPA_COLUNAS.items():
+        if origem in existentes and destino not in existentes:
+            mapa_seguro[origem] = destino
+            existentes.add(destino)
+
+    return df.rename(columns=mapa_seguro)
+
+
+def resolver_duplicatas(df, nome_base=""):
+    """Remove colunas duplicadas mantendo a primeira ocorrencia."""
+    dups = df.columns[df.columns.duplicated()].unique()
+    if len(dups):
+        print(f"  aviso ({nome_base}): colunas duplicadas removidas: {list(dups)}")
+    return df.loc[:, ~df.columns.duplicated()]
+
+
+# ---------------------------------------------------------------
+# Normalizacao de chaves
+# ---------------------------------------------------------------
+
+def normalizar_chave(serie):
+    """Padroniza texto: maiusculas, sem acento, sem espaco duplo."""
+    if isinstance(serie, pd.DataFrame):
+        serie = serie.iloc[:, 0]
+    return (
+        serie.astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.normalize("NFKD")
+        .str.encode("ascii", errors="ignore")
+        .str.decode("utf-8")
+    )
+
+
+def preparar_chaves(df):
+    df = df.copy()
+    df["_cat"] = normalizar_chave(df["Category SAP"])
+    df["_sub"] = normalizar_chave(df["SUB"])
+    df["_cust"] = normalizar_chave(df["Customer"])
+    return df
+
+
+def preparar_periodo(df, col_data=None, col_ano=None, col_mes=None):
+    """Gera _ano e _mes a partir de uma data ou de colunas separadas."""
+    df = df.copy()
+    if col_data is not None:
+        data = pd.to_datetime(df[col_data], dayfirst=True, errors="coerce")
+        df["_ano"] = data.dt.year
+        df["_mes"] = data.dt.month
+    else:
+        df["_ano"] = pd.to_numeric(df[col_ano], errors="coerce")
+        df["_mes"] = pd.to_numeric(df[col_mes], errors="coerce")
+    df["_ano"] = df["_ano"].astype("Int64")
+    df["_mes"] = df["_mes"].astype("Int64")
+    return df
+
+
+CHAVES = ["_cust", "_cat", "_sub", "_ano", "_mes"]
+
+
+# ---------------------------------------------------------------
+# Agregacao no nivel das chaves
+# ---------------------------------------------------------------
+
+def agregar_vendas(df, col_valor="Valor", col_su="SU"):
+    return (
+        df.groupby(CHAVES, dropna=False)
+        .agg(faturamento=(col_valor, "sum"), su=(col_su, "sum"))
+        .reset_index()
+    )
+
+
+def agregar_sell(df):
+    """
+    tbsell esta em granularidade MG5 (marca).
+    Agrega para o nivel das chaves antes do merge, senao duplica faturamento.
+    """
+    candidatas = ["MSU", "Valor", "GS/100", "GIV/100", "NIV/100",
+                  "NOS/100", "MDA/100", "GM/100", "NIT/100", "Expense"]
+    presentes = [c for c in candidatas if c in df.columns]
+    mapa = {f"sell_{c}": (c, "sum") for c in presentes}
+
+    return (
+        df.groupby(CHAVES, dropna=False)
+        .agg(**mapa)
+        .reset_index()
+    )
+
+
+# ---------------------------------------------------------------
+# Merge com diagnostico
+# ---------------------------------------------------------------
+
+def cruzar(vendas_agg, sell_agg):
+    merged = vendas_agg.merge(sell_agg, on=CHAVES, how="outer", indicator=True)
+
+    diagnostico = {
+        "linhas_vendas": len(vendas_agg),
+        "linhas_sell": len(sell_agg),
+        "casaram": int((merged["_merge"] == "both").sum()),
+        "so_vendas": int((merged["_merge"] == "left_only").sum()),
+        "so_sell": int((merged["_merge"] == "right_only").sum()),
+    }
+    total = diagnostico["casaram"] + diagnostico["so_vendas"] + diagnostico["so_sell"]
+    diagnostico["pct_casou"] = round(diagnostico["casaram"] / total * 100, 1) if total else 0
+
+    orfas_vendas = (
+        merged.loc[merged["_merge"] == "left_only", ["_cat", "_sub"]]
+        .drop_duplicates().sort_values(["_cat", "_sub"])
+    )
+    orfas_sell = (
+        merged.loc[merged["_merge"] == "right_only", ["_cat", "_sub"]]
+        .drop_duplicates().sort_values(["_cat", "_sub"])
+    )
+    return merged, diagnostico, orfas_vendas, orfas_sell
+
+
+def comparar_dominios(vendas, sell, coluna="_cat"):
+    a = set(vendas[coluna].dropna().unique())
+    b = set(sell[coluna].dropna().unique())
+    return {
+        "so_em_vendas": sorted(a - b),
+        "so_em_sell": sorted(b - a),
+        "em_ambas": sorted(a & b),
+    }
+
+
+# ---------------------------------------------------------------
+# Medidas do BI
+# ---------------------------------------------------------------
+
+def _div(numerador, denominador):
+    """Equivalente ao DIVIDE do DAX: divisao por zero vira NaN, nao inf."""
+    return numerador.divide(denominador).replace([np.inf, -np.inf], np.nan)
+
+
+def calcular_medidas(merged, ano_atual, nivel=("_cat",)):
+    """
+    Preco Medio SU = Faturamento / su1
+    Indice Valor   = Faturamento / Faturamento Ano Anterior * 100
+    Indice SU      = su1 / SU ANT * 100
+    SRM            = Indice Valor - Indice SU
+    BZ%            = Faturamento / total do escopo filtrado
+    """
+    nivel = list(nivel)
+    agregacoes = {
+        "faturamento": ("faturamento", "sum"),
+        "su": ("su", "sum"),
+    }
+    if "sell_MSU" in merged.columns:
+        agregacoes["msu"] = ("sell_MSU", "sum")
+    if "sell_Valor" in merged.columns:
+        agregacoes["valor_sell"] = ("sell_Valor", "sum")
+
+    atual = (
+        merged[merged["_ano"] == ano_atual]
+        .groupby(nivel, dropna=False).agg(**agregacoes)
+    )
+    anterior = (
+        merged[merged["_ano"] == ano_atual - 1]
+        .groupby(nivel, dropna=False)
+        .agg(faturamento_ant=("faturamento", "sum"), su_ant=("su", "sum"))
+    )
+
+    res = atual.join(anterior, how="left")
+
+    res["preco_medio_su"] = _div(res["faturamento"], res["su"])
+    res["indice_valor"] = _div(res["faturamento"], res["faturamento_ant"]) * 100
+    res["indice_su"] = _div(res["su"], res["su_ant"]) * 100
+    res["srm"] = res["indice_valor"] - res["indice_su"]
+
+    # BZ% usa o total do escopo filtrado, ignorando o nivel de linha.
+    # Equivale ao ALLSELECTED sobre Category SAP / SUB / GCAS.
+    res["bz_pct"] = _div(res["faturamento"], res["faturamento"].sum()) * 100
+
+    return res.sort_values("faturamento", ascending=False)
+
+
+# ---------------------------------------------------------------
+# Dashboard HTML
+# ---------------------------------------------------------------
+
+def gerar_dashboard_html(resultado, diagnostico, dominios, arquivo="dashboard_srm.html"):
+    """Gera um HTML unico que abre no navegador com duplo clique."""
+    dados = resultado.reset_index().to_json(orient="records", force_ascii=False)
+    diag = pd.Series(diagnostico).to_json(force_ascii=False)
+    so_vendas = pd.Series(dominios["so_em_vendas"], dtype=object).to_json(force_ascii=False)
+    so_sell = pd.Series(dominios["so_em_sell"], dtype=object).to_json(force_ascii=False)
+
+    html = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>SRM - sell-out x sell-in</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #faf8f4;
+         color: #1a1714; margin: 0; padding: 32px 28px 48px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .sobrancelha { font-family: Consolas, monospace; font-size: 11px;
+                 letter-spacing: 0.14em; text-transform: uppercase;
+                 color: #7a736b; margin-bottom: 8px; }
+  .sub { font-size: 14px; color: #5c554d; margin: 0; }
+  header { border-bottom: 2px solid #1a1714; padding-bottom: 18px;
+           margin-bottom: 24px; display: flex; justify-content: space-between;
+           align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+  .badge { font-family: Consolas, monospace; font-size: 12px; font-weight: 600;
+           color: #fff; border: none; padding: 10px 16px; cursor: pointer; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr));
+          gap: 1px; background: #ddd6cc; border: 1px solid #ddd6cc;
+          margin-bottom: 26px; }
+  .kpi { background: #fff; padding: 16px 18px; }
+  .kpi-rot { font-family: Consolas, monospace; font-size: 10.5px;
+             text-transform: uppercase; letter-spacing: 0.1em;
+             color: #7a736b; margin-bottom: 6px; }
+  .kpi-val { font-size: 24px; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px;
+          background: #fff; border: 1px solid #ddd6cc; }
+  th { font-family: Consolas, monospace; font-size: 10.5px; font-weight: 600;
+       text-transform: uppercase; letter-spacing: 0.08em; color: #5c554d;
+       text-align: right; padding: 12px 14px; border-bottom: 2px solid #1a1714;
+       white-space: nowrap; }
+  th:first-child { text-align: left; }
+  td { padding: 10px 14px; text-align: right; font-family: Consolas, monospace;
+       font-variant-numeric: tabular-nums; border-bottom: 1px solid #eee9e1;
+       white-space: nowrap; }
+  td:first-child { text-align: left; font-family: 'Segoe UI', sans-serif;
+                   font-weight: 500; }
+  tr:hover td { background: #f7f4ef; }
+  .sell { background: #f8f6f1; color: #1f5f7a; }
+  th.sell { background: #f2efe8; color: #1f5f7a; }
+  .total td { border-top: 2px solid #1a1714; font-weight: 700;
+              background: #f7f4ef; }
+  #diag { background: #fff; border: 1px solid #ddd6cc;
+          border-left: 3px solid #8a3324; padding: 18px 22px;
+          margin-bottom: 24px; display: none; }
+  #diag h2 { font-size: 16px; margin: 0 0 10px; }
+  .grid-diag { display: grid;
+               grid-template-columns: repeat(auto-fit, minmax(240px,1fr));
+               gap: 24px; }
+  .rot-diag { font-family: Consolas, monospace; font-size: 11px;
+              text-transform: uppercase; letter-spacing: 0.1em; color: #7a736b;
+              margin-bottom: 8px; padding-bottom: 6px;
+              border-bottom: 1px solid #e5ded4; }
+  .orfa { font-family: Consolas, monospace; font-size: 12.5px; padding: 4px 0; }
+  .rodape { font-size: 12.5px; color: #7a736b; margin-top: 18px;
+            line-height: 1.6; max-width: 680px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="sobrancelha">Base_Srm_Modelo &times; sellin</div>
+    <h1>Sell-out e sell-in lado a lado</h1>
+    <p class="sub">Cruzamento por Customer, Category SAP, SUB e periodo.</p>
+  </div>
+  <button class="badge" id="btn-diag" onclick="alternarDiag()"></button>
+</header>
+
+<div id="diag">
+  <h2>Diagnostico do cruzamento</h2>
+  <div id="diag-num"></div>
+  <div class="grid-diag" style="margin-top:16px">
+    <div><div class="rot-diag">Category SAP so em Base_Srm_Modelo</div>
+         <div id="orfa-v"></div></div>
+    <div><div class="rot-diag">Category SAP so em sellin</div>
+         <div id="orfa-s"></div></div>
+  </div>
+</div>
+
+<div class="kpis" id="kpis"></div>
+<table id="tabela"></table>
+<p class="rodape">Colunas em azul vem do sellin. SRM = indice de valor menos
+indice de SU, ambos contra o ano anterior. BZ% usa o total do escopo como
+denominador.</p>
+
+<script>
+const DADOS = __DADOS__;
+const DIAG = __DIAG__;
+const SO_VENDAS = Object.values(__SO_VENDAS__);
+const SO_SELL = Object.values(__SO_SELL__);
+
+const moeda = v => (v == null || isNaN(v)) ? "\\u2014" :
+  "R$ " + Math.round(v).toLocaleString("pt-BR");
+const num = (v, c = 2) => (v == null || isNaN(v)) ? "\\u2014" :
+  v.toLocaleString("pt-BR", {minimumFractionDigits: c, maximumFractionDigits: c});
+
+function corSRM(srm) {
+  if (srm == null || isNaN(srm)) return "";
+  const i = Math.min(Math.abs(srm) / 20, 1);
+  const a = (0.15 + i * 0.75).toFixed(2);
+  const fg = i > 0.45 ? "#fff" : (srm >= 0 ? "#123f2e" : "#5c1616");
+  const bg = srm >= 0 ? "rgba(31,122,90," + a + ")" : "rgba(176,48,48," + a + ")";
+  return "background:" + bg + ";color:" + fg + ";font-weight:600";
+}
+
+const soma = c => DADOS.reduce((s, l) => s + (l[c] || 0), 0);
+const totalFat = soma("faturamento"), totalSU = soma("su");
+const totalMSU = soma("msu"), totalValorSell = soma("valor_sell");
+const totalFatAnt = soma("faturamento_ant"), totalSUAnt = soma("su_ant");
+const srmTotal = (totalFatAnt && totalSUAnt)
+  ? (totalFat / totalFatAnt) * 100 - (totalSU / totalSUAnt) * 100 : null;
+
+document.getElementById("kpis").innerHTML = [
+  ["Faturamento", moeda(totalFat)],
+  ["Preco medio SU", num(totalSU ? totalFat / totalSU : null)],
+  ["SRM consolidado", num(srmTotal)],
+  ["MSU sell-in", num(totalMSU, 1)]
+].map(function(par) {
+  return '<div class="kpi"><div class="kpi-rot">' + par[0] +
+         '</div><div class="kpi-val">' + par[1] + '</div></div>';
+}).join("");
+
+const cabecalho = '<thead><tr>' +
+  '<th>Category SAP</th><th>SRM</th><th>Preco medio SU</th>' +
+  '<th>Faturamento</th><th>BZ%</th>' +
+  '<th class="sell">MSU</th><th class="sell">Valor sell-in</th>' +
+  '</tr></thead>';
+
+const linhas = DADOS.map(function(l) {
+  return '<tr>' +
+    '<td>' + l._cat + '</td>' +
+    '<td style="' + corSRM(l.srm) + '">' + num(l.srm) + '</td>' +
+    '<td>' + num(l.preco_medio_su) + '</td>' +
+    '<td>' + moeda(l.faturamento) + '</td>' +
+    '<td>' + num(l.bz_pct) + '%</td>' +
+    '<td class="sell">' + num(l.msu, 1) + '</td>' +
+    '<td class="sell">' + moeda(l.valor_sell) + '</td>' +
+    '</tr>';
+}).join("");
+
+const total = '<tr class="total">' +
+  '<td>Total</td><td>' + num(srmTotal) + '</td>' +
+  '<td>' + num(totalSU ? totalFat / totalSU : null) + '</td>' +
+  '<td>' + moeda(totalFat) + '</td><td>100,00%</td>' +
+  '<td class="sell">' + num(totalMSU, 1) + '</td>' +
+  '<td class="sell">' + moeda(totalValorSell) + '</td>' +
+  '</tr>';
+
+document.getElementById("tabela").innerHTML =
+  cabecalho + "<tbody>" + linhas + total + "</tbody>";
+
+const nOrfas = SO_VENDAS.length + SO_SELL.length;
+const btn = document.getElementById("btn-diag");
+btn.textContent = nOrfas + " categorias sem par";
+btn.style.background = nOrfas ? "#8a3324" : "#1f5f4a";
+
+document.getElementById("diag-num").innerHTML = Object.keys(DIAG)
+  .map(function(k) {
+    return '<div class="orfa"><strong>' + k + '</strong>: ' + DIAG[k] + '</div>';
+  }).join("");
+
+document.getElementById("orfa-v").innerHTML =
+  SO_VENDAS.map(function(c) { return '<div class="orfa">' + c + '</div>'; }).join("")
+  || '<div class="orfa">nenhuma</div>';
+document.getElementById("orfa-s").innerHTML =
+  SO_SELL.map(function(c) { return '<div class="orfa">' + c + '</div>'; }).join("")
+  || '<div class="orfa">nenhuma</div>';
+
+function alternarDiag() {
+  const d = document.getElementById("diag");
+  d.style.display = d.style.display === "block" ? "none" : "block";
+}
+</script>
+</body>
+</html>"""
+
+    html = (html
+            .replace("__DADOS__", dados)
+            .replace("__DIAG__", diag)
+            .replace("__SO_VENDAS__", so_vendas)
+            .replace("__SO_SELL__", so_sell))
+
+    caminho = os.path.abspath(arquivo)
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(html)
+    return caminho
+
+
+# ---------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------
+
+def executar():
+    print("Lendo Base_Srm_Modelo...")
+    vendas = resolver_duplicatas(
+        padronizar_colunas(ler_excel(CAMINHO_VENDAS, ABA_VENDAS)), "Base_Srm_Modelo"
+    )
+    print("Lendo sellin...")
+    sell = resolver_duplicatas(
+        padronizar_colunas(ler_excel(CAMINHO_SELL, ABA_SELL)), "sellin"
+    )
+
+    print("\nCOLUNAS Base_Srm_Modelo:")
+    print(" ", list(vendas.columns))
+    print("\nCOLUNAS sellin:")
+    print(" ", list(sell.columns))
+
+    faltando_v = [c for c in ["Category SAP", "SUB", "Customer"] if c not in vendas.columns]
+    faltando_s = [c for c in ["Category SAP", "SUB", "Customer"] if c not in sell.columns]
+    if faltando_v or faltando_s:
+        print("\nERRO: colunas de chave ausentes apos o rename.")
+        print("  Base_Srm_Modelo:", faltando_v)
+        print("  sellin:", faltando_s)
+        print("  Adicione o nome real ao MAPA_COLUNAS no topo do arquivo.")
+        return None
+
+    vendas = preparar_chaves(vendas)
+    sell = preparar_chaves(sell)
+
+    if "Data" in vendas.columns:
+        vendas = preparar_periodo(vendas, col_data="Data")
+    else:
+        vendas = preparar_periodo(vendas, col_ano="Ano", col_mes="Mês")
+
+    if "Ano" in sell.columns and "Mês" in sell.columns:
+        sell = preparar_periodo(sell, col_ano="Ano", col_mes="Mês")
+    else:
+        sell = preparar_periodo(sell, col_data="Data")
+
+    dominios = comparar_dominios(vendas, sell)
+    vendas_agg = agregar_vendas(vendas)
+    sell_agg = agregar_sell(sell)
+    merged, diag, orfas_v, orfas_s = cruzar(vendas_agg, sell_agg)
+    resultado = calcular_medidas(merged, ANO_ATUAL)
+
+    # ---- Relatorio no terminal ----
+    print("\n" + "=" * 60)
+    print("DIAGNOSTICO DO MERGE")
+    print("=" * 60)
+    for k, v in diag.items():
+        print(f"  {k}: {v}")
+
+    print(f"\nCATEGORY SAP so em Base_Srm_Modelo ({len(dominios['so_em_vendas'])}):")
+    print(" ", dominios["so_em_vendas"][:30])
+    print(f"\nCATEGORY SAP so em sellin ({len(dominios['so_em_sell'])}):")
+    print(" ", dominios["so_em_sell"][:30])
+    print(f"\nCATEGORY SAP em ambas ({len(dominios['em_ambas'])}):")
+    print(" ", dominios["em_ambas"][:30])
+
+    print("\n" + "=" * 60)
+    print(f"RESULTADO - {ANO_ATUAL} vs {ANO_ATUAL - 1}")
+    print("=" * 60)
+    print(resultado.round(2).to_string())
+
+    # ---- Arquivos gerados ----
+    with pd.ExcelWriter("resultado_srm.xlsx") as w:
+        resultado.reset_index().to_excel(w, sheet_name="resultado", index=False)
+        orfas_v.to_excel(w, sheet_name="orfas_vendas", index=False)
+        orfas_s.to_excel(w, sheet_name="orfas_sellin", index=False)
+
+    caminho_html = gerar_dashboard_html(resultado, diag, dominios)
+
+    print("\n" + "=" * 60)
+    print("ARQUIVOS GERADOS")
+    print("=" * 60)
+    print(f"  Excel:     {os.path.abspath('resultado_srm.xlsx')}")
+    print(f"  Dashboard: {caminho_html}")
+    print("\nAbra o dashboard com duplo clique.")
+
+    return {
+        "resultado": resultado,
+        "merged": merged,
+        "diagnostico": diag,
+        "dominios": dominios,
+    }
+
+
+if __name__ == "__main__":
+    executar()
