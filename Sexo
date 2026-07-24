@@ -1,0 +1,1 @@
+[Category SAP] & "|" & [SUB] & "|" & Text.From([Ano]) & "-" & Text.PadStart(Text.From([Mês]), 2, "0")
