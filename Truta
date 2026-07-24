@@ -1,0 +1,191 @@
+# ---------------------------------------------------------------
+# Geracao do dashboard HTML
+# ---------------------------------------------------------------
+
+def gerar_dashboard_html(resultado, diagnostico, dominios, arquivo="dashboard_srm.html"):
+    """Gera um HTML unico que abre no navegador com duplo clique."""
+    dados = resultado.reset_index().to_json(orient="records", force_ascii=False)
+    diag = pd.Series(diagnostico).to_json(force_ascii=False)
+    so_vendas = pd.Series(dominios["so_em_vendas"]).to_json(force_ascii=False)
+    so_sell = pd.Series(dominios["so_em_sell"]).to_json(force_ascii=False)
+
+    html = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>SRM - sell-out x sell-in</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #faf8f4;
+         color: #1a1714; margin: 0; padding: 32px 28px 48px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .sobrancelha { font-family: Consolas, monospace; font-size: 11px;
+                 letter-spacing: 0.14em; text-transform: uppercase;
+                 color: #7a736b; margin-bottom: 8px; }
+  .sub { font-size: 14px; color: #5c554d; margin: 0 0 24px; }
+  header { border-bottom: 2px solid #1a1714; padding-bottom: 18px;
+           margin-bottom: 24px; display: flex; justify-content: space-between;
+           align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+  .badge { font-family: Consolas, monospace; font-size: 12px; font-weight: 600;
+           color: #fff; border: none; padding: 10px 16px; cursor: pointer; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr));
+          gap: 1px; background: #ddd6cc; border: 1px solid #ddd6cc;
+          margin-bottom: 26px; }
+  .kpi { background: #fff; padding: 16px 18px; }
+  .kpi-rot { font-family: Consolas, monospace; font-size: 10.5px;
+             text-transform: uppercase; letter-spacing: 0.1em;
+             color: #7a736b; margin-bottom: 6px; }
+  .kpi-val { font-size: 24px; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px;
+          background: #fff; border: 1px solid #ddd6cc; }
+  th { font-family: Consolas, monospace; font-size: 10.5px; font-weight: 600;
+       text-transform: uppercase; letter-spacing: 0.08em; color: #5c554d;
+       text-align: right; padding: 12px 14px; border-bottom: 2px solid #1a1714;
+       white-space: nowrap; }
+  th:first-child { text-align: left; }
+  td { padding: 10px 14px; text-align: right; font-family: Consolas, monospace;
+       font-variant-numeric: tabular-nums; border-bottom: 1px solid #eee9e1;
+       white-space: nowrap; }
+  td:first-child { text-align: left; font-family: 'Segoe UI', sans-serif;
+                   font-weight: 500; }
+  tr:hover td { background: #f7f4ef; }
+  .sell { background: #f8f6f1; color: #1f5f7a; }
+  th.sell { background: #f2efe8; color: #1f5f7a; }
+  .total td { border-top: 2px solid #1a1714; font-weight: 700;
+              background: #f7f4ef; }
+  #diag { background: #fff; border: 1px solid #ddd6cc;
+          border-left: 3px solid #8a3324; padding: 18px 22px;
+          margin-bottom: 24px; display: none; }
+  #diag h2 { font-size: 16px; margin: 0 0 10px; }
+  .grid-diag { display: grid;
+               grid-template-columns: repeat(auto-fit, minmax(240px,1fr));
+               gap: 24px; }
+  .rot-diag { font-family: Consolas, monospace; font-size: 11px;
+              text-transform: uppercase; letter-spacing: 0.1em; color: #7a736b;
+              margin-bottom: 8px; padding-bottom: 6px;
+              border-bottom: 1px solid #e5ded4; }
+  .orfa { font-family: Consolas, monospace; font-size: 12.5px; padding: 4px 0; }
+  .rodape { font-size: 12.5px; color: #7a736b; margin-top: 18px;
+            line-height: 1.6; max-width: 680px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="sobrancelha">Base_Srm_Modelo &times; sellin</div>
+    <h1>Sell-out e sell-in lado a lado</h1>
+    <p class="sub">Cruzamento por Customer, Category SAP, SUB e periodo.</p>
+  </div>
+  <button class="badge" id="btn-diag" onclick="alternarDiag()"></button>
+</header>
+
+<div id="diag">
+  <h2>Diagnostico do cruzamento</h2>
+  <div id="diag-num"></div>
+  <div class="grid-diag" style="margin-top:16px">
+    <div><div class="rot-diag">Category SAP so em Base_Srm_Modelo</div>
+         <div id="orfa-v"></div></div>
+    <div><div class="rot-diag">Category SAP so em sellin</div>
+         <div id="orfa-s"></div></div>
+  </div>
+</div>
+
+<div class="kpis" id="kpis"></div>
+<table id="tabela"></table>
+<p class="rodape">Colunas em azul vem do sellin. SRM = indice de valor menos
+indice de SU, ambos contra o ano anterior. BZ% usa o total do escopo como
+denominador.</p>
+
+<script>
+const DADOS = __DADOS__;
+const DIAG = __DIAG__;
+const SO_VENDAS = __SO_VENDAS__;
+const SO_SELL = __SO_SELL__;
+
+const moeda = v => (v == null || isNaN(v)) ? "\\u2014" :
+  "R$ " + Math.round(v).toLocaleString("pt-BR");
+const num = (v, c = 2) => (v == null || isNaN(v)) ? "\\u2014" :
+  v.toLocaleString("pt-BR", {minimumFractionDigits: c, maximumFractionDigits: c});
+
+function corSRM(srm) {
+  if (srm == null || isNaN(srm)) return "";
+  const i = Math.min(Math.abs(srm) / 20, 1);
+  const a = (0.15 + i * 0.75).toFixed(2);
+  const fg = i > 0.45 ? "#fff" : (srm >= 0 ? "#123f2e" : "#5c1616");
+  const bg = srm >= 0 ? `rgba(31,122,90,${a})` : `rgba(176,48,48,${a})`;
+  return `background:${bg};color:${fg};font-weight:600`;
+}
+
+const soma = c => DADOS.reduce((s, l) => s + (l[c] || 0), 0);
+const totalFat = soma("faturamento"), totalSU = soma("su");
+const totalMSU = soma("msu"), totalValorSell = soma("valor_sell");
+const totalFatAnt = soma("faturamento_ant"), totalSUAnt = soma("su_ant");
+const srmTotal = totalFatAnt && totalSUAnt
+  ? (totalFat / totalFatAnt) * 100 - (totalSU / totalSUAnt) * 100 : null;
+
+document.getElementById("kpis").innerHTML = [
+  ["Faturamento", moeda(totalFat)],
+  ["Preco medio SU", num(totalSU ? totalFat / totalSU : null)],
+  ["SRM consolidado", num(srmTotal)],
+  ["MSU sell-in", num(totalMSU, 1)]
+].map(([r, v]) =>
+  `<div class="kpi"><div class="kpi-rot">${r}</div><div class="kpi-val">${v}</div></div>`
+).join("");
+
+const cabecalho = `<thead><tr>
+  <th>Category SAP</th><th>SRM</th><th>Preco medio SU</th>
+  <th>Faturamento</th><th>BZ%</th>
+  <th class="sell">MSU</th><th class="sell">Valor sell-in</th>
+</tr></thead>`;
+
+const linhas = DADOS.map(l => `<tr>
+  <td>${l._cat}</td>
+  <td style="${corSRM(l.srm)}">${num(l.srm)}</td>
+  <td>${num(l.preco_medio_su)}</td>
+  <td>${moeda(l.faturamento)}</td>
+  <td>${num(l.bz_pct)}%</td>
+  <td class="sell">${num(l.msu, 1)}</td>
+  <td class="sell">${moeda(l.valor_sell)}</td>
+</tr>`).join("");
+
+const total = `<tr class="total">
+  <td>Total</td><td>${num(srmTotal)}</td>
+  <td>${num(totalSU ? totalFat / totalSU : null)}</td>
+  <td>${moeda(totalFat)}</td><td>100,00%</td>
+  <td class="sell">${num(totalMSU, 1)}</td>
+  <td class="sell">${moeda(totalValorSell)}</td>
+</tr>`;
+
+document.getElementById("tabela").innerHTML =
+  cabecalho + "<tbody>" + linhas + total + "</tbody>";
+
+const nOrfas = SO_VENDAS.length + SO_SELL.length;
+const btn = document.getElementById("btn-diag");
+btn.textContent = nOrfas + " categorias sem par";
+btn.style.background = nOrfas ? "#8a3324" : "#1f5f4a";
+
+document.getElementById("diag-num").innerHTML = Object.entries(DIAG)
+  .map(([k, v]) => `<div class="orfa"><strong>${k}</strong>: ${v}</div>`).join("");
+document.getElementById("orfa-v").innerHTML =
+  SO_VENDAS.map(c => `<div class="orfa">${c}</div>`).join("") || "<div class='orfa'>nenhuma</div>";
+document.getElementById("orfa-s").innerHTML =
+  SO_SELL.map(c => `<div class="orfa">${c}</div>`).join("") || "<div class='orfa'>nenhuma</div>";
+
+function alternarDiag() {
+  const d = document.getElementById("diag");
+  d.style.display = d.style.display === "block" ? "none" : "block";
+}
+</script>
+</body>
+</html>"""
+
+    html = (html
+            .replace("__DADOS__", dados)
+            .replace("__DIAG__", diag)
+            .replace("__SO_VENDAS__", so_vendas)
+            .replace("__SO_SELL__", so_sell))
+
+    caminho = os.path.abspath(arquivo)
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(html)
+    return caminho
