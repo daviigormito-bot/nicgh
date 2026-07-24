@@ -1,0 +1,315 @@
+"""
+Cruzamento Base_Srm_Modelo x sellin e replicacao das medidas DAX do projeto dsrm.
+
+Chaves: Customer + Category SAP + SUB + Ano + Mes
+Saida: diagnostico do merge + tabela consolidada + JSON para o dashboard.
+
+Uso:
+    pip install pandas openpyxl
+    python dsrm_merge.py
+"""
+
+import pandas as pd
+import numpy as np
+import shutil
+import os
+import tempfile
+
+
+# ---------------------------------------------------------------
+# CONFIGURACAO - ajuste apenas esta secao
+# ---------------------------------------------------------------
+
+CAMINHO_VENDAS = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\SRM_Dashboard\Base_Srm_Modelo.xlsx"
+CAMINHO_SELL = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\sellin - Copy (2).xlsx"
+
+ABA_VENDAS = 0
+ABA_SELL = "tbsell"
+
+ANO_ATUAL = 2026
+
+# Variacoes de nome de coluna que devem virar um nome unico.
+MAPA_COLUNAS = {
+    "Categoria SAP": "Category SAP",
+    "Categoria Sap": "Category SAP",
+    "CATEGORIA SAP": "Category SAP",
+    "categoria sap": "Category SAP",
+    "Category Sap": "Category SAP",
+    "CATEGORY SAP": "Category SAP",
+    "Subcategoria": "SUB",
+    "SubCategoria": "SUB",
+    "Sub": "SUB",
+    "Cliente": "Customer",
+    "CLIENTE": "Customer",
+    "Mes": "Mês",
+    "MES": "Mês",
+}
+
+
+# ---------------------------------------------------------------
+# Leitura resiliente (contorna OneDrive read-only)
+# ---------------------------------------------------------------
+
+def ler_excel(caminho, aba):
+    """Le o Excel. Se o arquivo estiver travado pelo OneDrive, copia para temp."""
+    try:
+        return pd.read_excel(caminho, sheet_name=aba)
+    except (PermissionError, OSError):
+        destino = os.path.join(tempfile.gettempdir(), os.path.basename(caminho))
+        shutil.copy2(caminho, destino)
+        print(f"  aviso: arquivo travado, lendo copia em {destino}")
+        return pd.read_excel(destino, sheet_name=aba)
+
+
+def padronizar_colunas(df):
+    """Unifica variacoes de nome e remove espacos das bordas."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.rename(columns=MAPA_COLUNAS)
+
+
+# ---------------------------------------------------------------
+# Normalizacao de chaves
+# ---------------------------------------------------------------
+
+def normalizar_chave(serie):
+    """Padroniza texto: maiusculas, sem acento, sem espaco duplo."""
+    return (
+        serie.astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.normalize("NFKD")
+        .str.encode("ascii", errors="ignore")
+        .str.decode("utf-8")
+    )
+
+
+def preparar_chaves(df):
+    df = df.copy()
+    df["_cat"] = normalizar_chave(df["Category SAP"])
+    df["_sub"] = normalizar_chave(df["SUB"])
+    df["_cust"] = normalizar_chave(df["Customer"])
+    return df
+
+
+def preparar_periodo(df, col_data=None, col_ano=None, col_mes=None):
+    """Gera _ano e _mes a partir de uma data ou de colunas separadas."""
+    df = df.copy()
+    if col_data is not None:
+        data = pd.to_datetime(df[col_data], dayfirst=True, errors="coerce")
+        df["_ano"] = data.dt.year
+        df["_mes"] = data.dt.month
+    else:
+        df["_ano"] = pd.to_numeric(df[col_ano], errors="coerce")
+        df["_mes"] = pd.to_numeric(df[col_mes], errors="coerce")
+    df["_ano"] = df["_ano"].astype("Int64")
+    df["_mes"] = df["_mes"].astype("Int64")
+    return df
+
+
+CHAVES = ["_cust", "_cat", "_sub", "_ano", "_mes"]
+
+
+# ---------------------------------------------------------------
+# Agregacao no nivel das chaves
+# ---------------------------------------------------------------
+
+def agregar_vendas(df, col_valor="Valor", col_su="SU"):
+    return (
+        df.groupby(CHAVES, dropna=False)
+        .agg(faturamento=(col_valor, "sum"), su=(col_su, "sum"))
+        .reset_index()
+    )
+
+
+def agregar_sell(df):
+    """
+    tbsell esta em granularidade MG5 (marca).
+    Agrega para o nivel das chaves antes do merge, senao duplica faturamento.
+    """
+    candidatas = ["MSU", "Valor", "GS/100", "GIV/100", "NIV/100",
+                  "NOS/100", "MDA/100", "GM/100", "NIT/100", "Expense"]
+    presentes = [c for c in candidatas if c in df.columns]
+    mapa = {f"sell_{c}": (c, "sum") for c in presentes}
+
+    return (
+        df.groupby(CHAVES, dropna=False)
+        .agg(**mapa)
+        .reset_index()
+    )
+
+
+# ---------------------------------------------------------------
+# Merge com diagnostico
+# ---------------------------------------------------------------
+
+def cruzar(vendas_agg, sell_agg):
+    merged = vendas_agg.merge(sell_agg, on=CHAVES, how="outer", indicator=True)
+
+    diagnostico = {
+        "linhas_vendas": len(vendas_agg),
+        "linhas_sell": len(sell_agg),
+        "casaram": int((merged["_merge"] == "both").sum()),
+        "so_vendas": int((merged["_merge"] == "left_only").sum()),
+        "so_sell": int((merged["_merge"] == "right_only").sum()),
+    }
+    total = diagnostico["casaram"] + diagnostico["so_vendas"] + diagnostico["so_sell"]
+    diagnostico["pct_casou"] = round(diagnostico["casaram"] / total * 100, 1) if total else 0
+
+    orfas_vendas = (
+        merged.loc[merged["_merge"] == "left_only", ["_cat", "_sub"]]
+        .drop_duplicates().sort_values(["_cat", "_sub"])
+    )
+    orfas_sell = (
+        merged.loc[merged["_merge"] == "right_only", ["_cat", "_sub"]]
+        .drop_duplicates().sort_values(["_cat", "_sub"])
+    )
+    return merged, diagnostico, orfas_vendas, orfas_sell
+
+
+def comparar_dominios(vendas, sell, coluna="_cat"):
+    a = set(vendas[coluna].dropna().unique())
+    b = set(sell[coluna].dropna().unique())
+    return {
+        "so_em_vendas": sorted(a - b),
+        "so_em_sell": sorted(b - a),
+        "em_ambas": sorted(a & b),
+    }
+
+
+# ---------------------------------------------------------------
+# Medidas do BI
+# ---------------------------------------------------------------
+
+def _div(numerador, denominador):
+    """Equivalente ao DIVIDE do DAX: divisao por zero vira NaN, nao inf."""
+    return numerador.divide(denominador).replace([np.inf, -np.inf], np.nan)
+
+
+def calcular_medidas(merged, ano_atual, nivel=("_cat",)):
+    """
+    Preco Medio SU = Faturamento / su1
+    Indice Valor   = Faturamento / Faturamento Ano Anterior * 100
+    Indice SU      = su1 / SU ANT * 100
+    SRM            = Indice Valor - Indice SU
+    BZ%            = Faturamento / total do escopo filtrado
+    """
+    nivel = list(nivel)
+    agregacoes = {
+        "faturamento": ("faturamento", "sum"),
+        "su": ("su", "sum"),
+    }
+    if "sell_MSU" in merged.columns:
+        agregacoes["msu"] = ("sell_MSU", "sum")
+    if "sell_Valor" in merged.columns:
+        agregacoes["valor_sell"] = ("sell_Valor", "sum")
+
+    atual = (
+        merged[merged["_ano"] == ano_atual]
+        .groupby(nivel, dropna=False).agg(**agregacoes)
+    )
+    anterior = (
+        merged[merged["_ano"] == ano_atual - 1]
+        .groupby(nivel, dropna=False)
+        .agg(faturamento_ant=("faturamento", "sum"), su_ant=("su", "sum"))
+    )
+
+    res = atual.join(anterior, how="left")
+
+    res["preco_medio_su"] = _div(res["faturamento"], res["su"])
+    res["indice_valor"] = _div(res["faturamento"], res["faturamento_ant"]) * 100
+    res["indice_su"] = _div(res["su"], res["su_ant"]) * 100
+    res["srm"] = res["indice_valor"] - res["indice_su"]
+
+    # BZ% usa o total do escopo filtrado, ignorando o nivel de linha.
+    # Equivale ao ALLSELECTED sobre Category SAP / SUB / GCAS.
+    res["bz_pct"] = _div(res["faturamento"], res["faturamento"].sum()) * 100
+
+    return res.sort_values("faturamento", ascending=False)
+
+
+# ---------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------
+
+def executar():
+    print("Lendo Base_Srm_Modelo...")
+    vendas = padronizar_colunas(ler_excel(CAMINHO_VENDAS, ABA_VENDAS))
+    print("Lendo sellin...")
+    sell = padronizar_colunas(ler_excel(CAMINHO_SELL, ABA_SELL))
+
+    print("\nCOLUNAS Base_Srm_Modelo:")
+    print(" ", list(vendas.columns))
+    print("\nCOLUNAS sellin:")
+    print(" ", list(sell.columns))
+
+    faltando_v = [c for c in ["Category SAP", "SUB", "Customer"] if c not in vendas.columns]
+    faltando_s = [c for c in ["Category SAP", "SUB", "Customer"] if c not in sell.columns]
+    if faltando_v or faltando_s:
+        print("\nERRO: colunas de chave ausentes apos o rename.")
+        print("  Base_Srm_Modelo:", faltando_v)
+        print("  sellin:", faltando_s)
+        print("  Adicione o nome real ao MAPA_COLUNAS no topo do arquivo.")
+        return None
+
+    vendas = preparar_chaves(vendas)
+    sell = preparar_chaves(sell)
+
+    # Periodo: usa Data se existir, senao Ano + Mes
+    if "Data" in vendas.columns:
+        vendas = preparar_periodo(vendas, col_data="Data")
+    else:
+        vendas = preparar_periodo(vendas, col_ano="Ano", col_mes="Mês")
+
+    if "Ano" in sell.columns and "Mês" in sell.columns:
+        sell = preparar_periodo(sell, col_ano="Ano", col_mes="Mês")
+    else:
+        sell = preparar_periodo(sell, col_data="Data")
+
+    dominios = comparar_dominios(vendas, sell)
+    vendas_agg = agregar_vendas(vendas)
+    sell_agg = agregar_sell(sell)
+    merged, diag, orfas_v, orfas_s = cruzar(vendas_agg, sell_agg)
+    resultado = calcular_medidas(merged, ANO_ATUAL)
+
+    # ---- Relatorio ----
+    print("\n" + "=" * 60)
+    print("DIAGNOSTICO DO MERGE")
+    print("=" * 60)
+    for k, v in diag.items():
+        print(f"  {k}: {v}")
+
+    print(f"\nCATEGORY SAP so em Base_Srm_Modelo ({len(dominios['so_em_vendas'])}):")
+    print(" ", dominios["so_em_vendas"][:30])
+    print(f"\nCATEGORY SAP so em sellin ({len(dominios['so_em_sell'])}):")
+    print(" ", dominios["so_em_sell"][:30])
+    print(f"\nCATEGORY SAP em ambas ({len(dominios['em_ambas'])}):")
+    print(" ", dominios["em_ambas"][:30])
+
+    print("\n" + "=" * 60)
+    print(f"RESULTADO - {ANO_ATUAL} vs {ANO_ATUAL - 1}")
+    print("=" * 60)
+    print(resultado.round(2).to_string())
+
+    # ---- Exportacao ----
+    resultado.reset_index().to_json(
+        "resultado_dashboard.json", orient="records", force_ascii=False
+    )
+    with pd.ExcelWriter("resultado_srm.xlsx") as w:
+        resultado.reset_index().to_excel(w, sheet_name="resultado", index=False)
+        orfas_v.to_excel(w, sheet_name="orfas_vendas", index=False)
+        orfas_s.to_excel(w, sheet_name="orfas_sellin", index=False)
+
+    print("\nGerados: resultado_srm.xlsx e resultado_dashboard.json")
+
+    return {
+        "resultado": resultado,
+        "merged": merged,
+        "diagnostico": diag,
+        "dominios": dominios,
+    }
+
+
+if __name__ == "__main__":
+    executar()
