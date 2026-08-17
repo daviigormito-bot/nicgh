@@ -1,0 +1,63 @@
+import pandas as pd
+import numpy as np
+
+# ---- Ajuste o nome do arquivo e da aba ----
+df = pd.read_excel("tabela1.xlsx", sheet_name=0)
+
+# Padroniza nomes de coluna (ajuste a esquerda se os seus diferirem)
+df = df.rename(columns={
+    "Sum of investimento": "investimento",
+    "Sum of Qtd Vendida": "qtd_vendida",
+})
+
+# EAN = 12 digitos a esquerda da chave
+df["ean"] = df["chave"].astype(str).str.strip().str[:12]
+
+# Sazonal: dli == "y"
+df["sazonal"] = (df["dli"].astype(str).str.strip().str.lower() == "y").astype(int)
+
+# Converte para numero (erros viram NaN)
+for col in ["volume", "sellout"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ---- Limpeza: remove linhas sem volume/sellout validos ----
+validos = df[(df["volume"] > 0) & (df["sellout"] > 0)].copy()
+
+# ---- CORRECAO: preco por unidade de VOLUME, nao por quantidade ----
+validos["preco"] = validos["sellout"] / validos["volume"]
+
+# ---- Elasticidade por EAN (regressao log-log: ln volume vs ln preco) ----
+def elasticidade(g):
+    if len(g) < 4 or g["preco"].nunique() < 3:
+        return np.nan  # pontos insuficientes ou preco sem variacao
+    x = np.log(g["preco"].values)
+    y = np.log(g["volume"].values)
+    return np.polyfit(x, y, 1)[0]
+
+elast = (validos.groupby("ean")
+         .apply(elasticidade)
+         .rename("elasticidade")
+         .reset_index())
+
+# n de meses validos e variacao de preco (para saber se e confiavel)
+resumo = (validos.groupby("ean")
+          .agg(n_meses=("volume", "size"),
+               precos_distintos=("preco", "nunique"),
+               var_preco=("preco", lambda s: s.max() - s.min()))
+          .reset_index())
+
+# ---- Fator sazonal: volume medio sazonal / volume medio normal, por EAN ----
+piv = (validos.groupby(["ean", "sazonal"])["volume"].mean()
+       .unstack(fill_value=np.nan))
+piv["fator_sazonal"] = piv.get(1) / piv.get(0)
+fator = piv["fator_sazonal"].reset_index()
+
+# ---- Consolida ----
+res = (elast.merge(resumo, on="ean", how="left")
+            .merge(fator, on="ean", how="left"))
+res["confiavel"] = np.where(
+    res["elasticidade"].notna() & (res["n_meses"] >= 4) & (res["precos_distintos"] >= 3),
+    "sim", "rever")
+
+res.to_excel("elasticidades.xlsx", index=False)
+print(res)
