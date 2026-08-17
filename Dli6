@@ -1,0 +1,105 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+# ============ 1. Carrega base e elasticidades ============
+df = pd.read_excel(
+    r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\araujoestimado.xlsx",
+    sheet_name=0
+).rename(columns={
+    "Sum of investimento": "investimento",
+    "Sum of Qtd Vendida": "qtd_vendida",
+})
+elast = pd.read_excel(
+    r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\elasticidades1.xlsx"
+)
+
+# Remove linhas sem chave
+df = df[df["chave"].notna()].copy()
+
+# EAN como TEXTO (12 digitos a esquerda da chave), sem notacao cientifica
+df["ean"] = (df["chave"].astype(str).str.replace(r"\.0$", "", regex=True)
+             .str.strip().str[:12])
+elast["ean"] = (elast["ean"].astype(str).str.replace(r"\.0$", "", regex=True)
+                .str.strip())
+
+# Sazonal: dli == "y"
+df["sazonal"] = (df["dli"].astype(str).str.strip().str.lower() == "y").astype(int)
+
+# Numeros
+for col in ["volume", "sellout", "investimento"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+df = df[(df["volume"] > 0) & (df["sellout"] > 0)].copy()
+
+# Preco por unidade de VOLUME
+df["preco"] = df["sellout"] / df["volume"]
+
+# ============ 2. Trata elasticidades faltantes (rever) ============
+elast["elasticidade"] = pd.to_numeric(elast["elasticidade"], errors="coerce")
+elast_ok = elast[elast["confiavel"] == "sim"]
+elast_mediana = elast_ok["elasticidade"].median()
+elast["elast_final"] = elast["elasticidade"].fillna(elast_mediana)
+
+# ============ 3. Monta Tabela 2 (cenario sazonal, dli=y) ============
+saz = df[df["sazonal"] == 1]
+nao_saz = df[df["sazonal"] == 0]
+
+# preco_ref: media ponderada por volume dos precos sazonais, por EAN
+def preco_ref(g):
+    return np.average(g["preco"], weights=g["volume"])
+ref = saz.groupby("ean").apply(preco_ref).rename("preco_ref").reset_index()
+
+# baseline_volume: volume medio fora de promocao, por EAN
+base = nao_saz.groupby("ean")["volume"].mean().rename("baseline_volume").reset_index()
+
+# fallback para EAN sem periodo nao-sazonal
+saz_vol = saz.groupby("ean")["volume"].mean().rename("baseline_saz").reset_index()
+
+tab2 = (ref.merge(base, on="ean", how="left")
+           .merge(saz_vol, on="ean", how="left")
+           .merge(elast[["ean", "elast_final"]], on="ean", how="left"))
+tab2["baseline_volume"] = tab2["baseline_volume"].fillna(tab2["baseline_saz"])
+tab2["elast_final"] = tab2["elast_final"].fillna(elast_mediana)
+
+# fator sazonal por EAN (media saz / media nao-saz); 1.0 onde nao calcula
+fs = (saz.groupby("ean")["volume"].mean() /
+      nao_saz.groupby("ean")["volume"].mean()).rename("fator_sazonal").reset_index()
+tab2 = tab2.merge(fs, on="ean", how="left")
+tab2["fator_sazonal"] = tab2["fator_sazonal"].fillna(1.0)
+
+tab2 = tab2.dropna(subset=["preco_ref", "baseline_volume"]).reset_index(drop=True)
+
+# ============ 4. Orcamento = investimento maximo em periodo dli=y ============
+inv_por_periodo = saz.groupby(["ano", "mes"])["investimento"].sum()
+orcamento = inv_por_periodo.max()
+
+# ============ 5. Otimizacao: max ROI volume, s.a. ROI sellout>=1 ============
+n = len(tab2)
+preco_ref_arr = tab2["preco_ref"].values
+elast_arr = tab2["elast_final"].values
+baseline = tab2["baseline_volume"].values
+fator_saz = tab2["fator_sazonal"].values
+
+PISO_FRAC = 0.50   # usa pelo menos 50% do teto (ajuste conforme politica)
+
+def desnormaliza(x):
+    precos = preco_ref_arr * x[:n]          # fracao [0.80,1.20] do ref
+    invest = x[n:] * orcamento              # fracao [0,1] do teto
+    return precos, invest
+
+def volume_incremental(precos):
+    return baseline * ((precos / preco_ref_arr) ** elast_arr * fator_saz - 1)
+
+# OBJETIVO: ROI de volume = volume incremental total / investimento total
+def objetivo(x):
+    precos, invest = desnormaliza(x)
+    total_inv = np.sum(invest)
+    return -np.sum(volume_incremental(precos)) / max(total_inv, 1e-6)
+
+def roi_sellout(x):
+    precos, invest = desnormaliza(x)
+    sellout_inc = np.sum(precos * volume_incremental(precos))
+    return sellout_inc / max(np.sum(invest), 1e-6) - 1.0     # >=0 <=> ROI>=1
+
+restricoes = [
+    {"type": "ineq", "fun": roi_sellout},
