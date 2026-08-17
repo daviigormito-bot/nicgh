@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+# ============ 1. Carrega base e elasticidades ============
+df = pd.read_excel(
+    r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\araujoestimado.xlsx",
+    sheet_name=0
+).rename(columns={
+    "Sum of investimento": "investimento",
+    "Sum of Qtd Vendida": "qtd_vendida",
+})
+elast = pd.read_excel(
+    r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\elasticidades1.xlsx"
+)
+
+# Remove linhas sem chave
+df = df[df["chave"].notna()].copy()
+
+# EAN como TEXTO (12 digitos a esquerda da chave), sem notacao cientifica
+df["ean"] = (df["chave"].astype(str).str.replace(r"\.0$", "", regex=True)
+             .str.strip().str[:12])
+elast["ean"] = (elast["ean"].astype(str).str.replace(r"\.0$", "", regex=True)
+                .str.strip())
+
+# Sazonal: dli == "y"
+df["sazonal"] = (df["dli"].astype(str).str.strip().str.lower() == "y").astype(int)
+
+# Numeros
+for col in ["volume", "sellout", "investimento"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+df = df[(df["volume"] > 0) & (df["sellout"] > 0)].copy()
+
+# Preco por unidade de VOLUME
+df["preco"] = df["sellout"] / df["volume"]
+
+# ============ 2. Trata elasticidades faltantes (rever) ============
+elast["elasticidade"] = pd.to_numeric(elast["elasticidade"], errors="coerce")
+elast_ok = elast[elast["confiavel"] == "sim"]
+elast_mediana = elast_ok["elasticidade"].median()
+elast["elast_final"] = elast["elasticidade"].fillna(elast_mediana)
+
+# ============ 3. Monta Tabela 2 (cenario sazonal, dli=y) ============
+saz = df[df["sazonal"] == 1]
+nao_saz = df[df["sazonal"] == 0]
+
+# preco_ref: media ponderada por volume dos precos sazonais, por EAN
+def preco_ref(g):
+    return np.average(g["preco"], weights=g["volume"])
+ref = saz.groupby("ean").apply(preco_ref).rename("preco_ref").reset_index()
+
+# baseline_volume: volume medio fora de promocao, por EAN
+base = nao_saz.groupby("ean")["volume"].mean().rename("baseline_volume").reset_index()
+
+# fallback para EAN sem periodo nao-sazonal
+saz_vol = saz.groupby("ean")["volume"].mean().rename("baseline_saz").reset_index()
+
+tab2 = (ref.merge(base, on="ean", how="left")
+           .merge(saz_vol, on="ean", how="left")
+           .merge(elast[["ean", "elast_final"]], on="ean", how="left"))
+tab2["baseline_volume"] = tab2["baseline_volume"].fillna(tab2["baseline_saz"])
+tab2["elast_final"] = tab2["elast_final"].fillna(elast_mediana)
+
+# fator sazonal por EAN (media saz / media nao-saz); 1.0 onde nao calcula
+fs = (saz.groupby("ean")["volume"].mean() /
+      nao_saz.groupby("ean")["volume"].mean()).rename("fator_sazonal").reset_index()
+tab2 = tab2.merge(fs, on="ean", how="left")
+tab2["fator_sazonal"] = tab2["fator_sazonal"].fillna(1.0)
+
+tab2 = tab2.dropna(subset=["preco_ref", "baseline_volume"]).reset_index(drop=True)
+
+# ============ 4. Orcamento = investimento maximo em periodo dli=y ============
+inv_por_periodo = saz.groupby(["ano", "mes"])["investimento"].sum()
+orcamento = inv_por_periodo.max()
+# alternativa por EAN: orcamento = saz.groupby("ean")["investimento"].sum().max()
+
+# ============ 5. Otimizacao ============
+n = len(tab2)
+preco_ref_arr = tab2["preco_ref"].values
+elast_arr = tab2["elast_final"].values
+baseline = tab2["baseline_volume"].values
+fator_saz = tab2["fator_sazonal"].values
+
+def volume_incremental(precos):
+    return baseline * ((precos / preco_ref_arr) ** elast_arr * fator_saz - 1)
+
+def roi_volume(x):
+    invest = x[n:]
+    return -np.sum(volume_incremental(x[:n])) / max(np.sum(invest), 1e-6)
+
+def roi_sellout(x):
+    precos = x[:n]
+    invest = x[n:]
+    sellout_inc = precos * volume_incremental(precos)
+    return np.sum(sellout_inc) / max(np.sum(invest), 1e-6) - 1.0
+
+restricoes = [
+    {"type": "ineq", "fun": roi_sellout},
+    {"type": "ineq", "fun": lambda x: orcamento - np.sum(x[n:])},
+    {"type": "ineq", "fun": lambda x: np.sum(x[n:]) - 0.5 * orcamento},
+]
+
+bounds = ([(preco_ref_arr[i] * 0.80, preco_ref_arr[i] * 1.20) for i in range(n)]
+          + [(0, orcamento) for _ in range(n)])
+
+x0 = np.concatenate([preco_ref_arr, np.full(n, orcamento / n)])
+
+res = minimize(roi_volume, x0, method="SLSQP", bounds=bounds,
+               constraints=restricoes, options={"maxiter": 500})
+
+# ============ 6. Resultado ============
+tab2["preco_otimo"] = res.x[:n]
+tab2["investimento_otimo"] = res.x[n:]
+tab2["volume_incremental"] = volume_incremental(res.x[:n])
+tab2["sellout_incremental"] = tab2["preco_otimo"] * tab2["volume_incremental"]
+
+roi_vol = tab2["volume_incremental"].sum() / tab2["investimento_otimo"].sum()
+roi_sell = tab2["sellout_incremental"].sum() / tab2["investimento_otimo"].sum()
+
+print(f"Orcamento (max periodo dli=y): {orcamento:,.2f}")
+print(f"Convergiu: {res.success} | {res.message}")
+print(f"ROI volume: {roi_vol:.3f} | ROI sellout: {roi_sell:.3f}")
+
+saida = r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\resultado_otimizacao.xlsx"
+tab2.to_excel(saida, index=False)
+print("Salvo em:", saida)
+print(tab2[["ean", "preco_ref", "preco_otimo", "investimento_otimo",
+            "volume_incremental", "sellout_incremental"]])
