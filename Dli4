@@ -1,0 +1,18 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+df = pd.read_excel(r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\araujoestimado.xlsx", sheet_name=0).rename(columns={
+    "Sum of investimento": "investimento",
+    "Sum of Qtd Vendida": "qtd_vendida",
+})
+elast = pd.read_excel(r"C:\Users\silva.d.6\OneDrive - Procter and Gamble\Desktop\limitecredito\elasticidades1.xlsx")
+
+# EAN como TEXTO nas duas pontas, sem notacao cientifica
+df["ean"] = df["ean"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+elast["ean"] = elast["ean"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+# Diagnostico: confirme que os EANs batem
+print("EANs no df:", sorted(df["ean"].unique())[:5])
+print("EANs no elast:", sorted(elast["ean"].unique())[:5])
+print("EANs em comum:", len(set(df["ean"]) & set(elast["ean"])))
