@@ -1,0 +1,652 @@
+"""
+Otimizador de Descontos e Alocacao de Investimento para Sazonalidade (DLI)
+Revenue Management / Trade Marketing Financeiro
+
+Objetivo: maximizar o ROI de Volume Incremental da carteira, respeitando teto
+e piso de orcamento global historico, cortando EANs ineficientes e recomendando
+faixa de desconto por EAN ativado.
+
+Abordagem: o problema e um knapsack fracionario (sem acoplamento entre EANs
+alem do orcamento global), portanto a solucao otima e analitica -- ordenar os
+EANs por eficiencia marginal de volume e preencher o orcamento ate o teto.
+Nao requer solver externo; scipy e usado apenas para ajuste de sensibilidade
+preco-desconto quando ha historico suficiente.
+"""
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# PARAMETROS
+# ---------------------------------------------------------------------------
+ARQUIVO = "/mnt/user-data/uploads/xdxds.txt"
+SEP = "\t"
+
+PISO_ORCAMENTO = 0.70          # piso = 70% do teto global historico
+FAIXA_DESCONTO_FLEX = 0.20     # +/- 20% sobre a faixa de desconto historica
+
+# Teto absoluto de INVESTIMENTO BRUTO TOTAL da carteira (verba total concedida,
+# = soma de d * preco * volume total). NAO e o investimento incremental -- este
+# sera ainda menor (bruto - baseline). A alocacao usa como teto efetivo o MENOR
+# entre este valor e a verba bruta da ultima DLI. None desativa o limite.
+INVESTIMENTO_TOTAL_MAX = 750_000.0
+
+# Modelo de verba-como-desconto: Inv(d) = d * preco_base * Q(d).
+# Faixa de desconto travada em 50% como limite duro superior (guarda tecnica).
+DESCONTO_MAX_ROI = 0.50
+
+# OBJETIVO: maximizar o sell-out incremental (dSellout) da carteira ativada.
+# Cada EAN recebe o desconto de MAXIMA EFICIENCIA incremental (dSellout/dInv);
+# a carteira e preenchida por ordem dessa eficiencia ate o teto. Isso maximiza
+# o ROI incremental total por construcao.
+#
+# METAS DE CARTEIRA (totais, vs. ultima DLI realizada):
+#   - ROI incremental total = soma(dSellout) / soma(dInv) >= ROIIC_MIN, e
+#     tambem > ROI incremental da ultima DLI. Como a segunda condicao domina
+#     (ROIic 2026 ~ 1,42 > 1,3), a trava efetiva e superar o ano anterior.
+#   - Sell-out incremental total > sell-out incremental da ultima DLI.
+# Ambas sao verificadas e reportadas; a alocacao pausa antes de violar o ROIic.
+ROIIC_MIN = 1.30               # piso absoluto de ROI incremental total
+
+# Elasticidade-preco assumida (premissa, nao estimada dos dados). Cenario base.
+ELASTICIDADE_BASE = -1.2
+
+# Piso de desconto competitivo: abaixo disso, ativar nao move o consumidor e
+# apenas dilui verba -- o EAN e cortado e a verba realocada. Concentra o
+# orcamento em ativacoes competitivas.
+DESCONTO_MIN_COMPETITIVO = 0.08
+
+# Subcategorias protegidas de corte (bom desempenho comprovado na ultima DLI).
+# EANs dessas SUBs nao sao cortados por eficiencia nem pelo piso competitivo, e
+# entram na alocacao antes dos demais. Ainda respeitam o teto e a trava de 50%.
+# - MACH 3 CARTRIDGE: melhor desempenho Shave Care na ultima DLI.
+# - PANTS OTHERS: melhor desempenho Baby Care (maior sell-out e ROI ~3,0),
+#   garante presenca forte da categoria sem que todo o Baby Care domine a verba.
+SUBS_PROTEGIDAS = {"MACH 3 CARTRIDGE", "PANTS OTHERS"}
+
+# Teto de share por SUB protegida: cada subcategoria protegida consome no maximo
+# esta fracao do teto total. Impede que as protegidas (que entram primeiro com
+# desconto maximo) monopolizem o orcamento, liberando espaco para as demais
+# categorias. Aplica-se apenas as SUBS_PROTEGIDAS.
+SHARE_MAX_SUB_PROTEGIDA = 0.35
+
+# Categorias protegidas inteiras: vazio nesta rodada. Baby Care entra via a SUB
+# Pants Others acima; os demais Baby Care disputam por eficiencia normalmente.
+CATEGORIAS_PROTEGIDAS = set()
+
+# Categorias descartadas desta rodada (flag reativavel). EANs dessas categorias
+# nao entram na analise. Esvaziar o conjunto para reativar.
+CATEGORIAS_DESCARTADAS = {"HAIR CARE"}
+
+COLS_NUMERICAS = [
+    "Sum of investimento", "Sum of Qtd Vendida", "sellout",
+    "su", "PREÇO/su", "preco/it",
+]
+
+SAIDA_DETALHE = "/mnt/user-data/outputs/dli_detalhe_por_ean.xlsx"
+SAIDA_EXEC = "/mnt/user-data/outputs/dli_resumo_executivo.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# 1. CARGA E LIMPEZA
+# ---------------------------------------------------------------------------
+def limpar_numero(valor):
+    """Converte texto em formato BR (virgula decimal) para float. Trata erros."""
+    if pd.isna(valor):
+        return np.nan
+    s = str(valor).strip()
+    if s in ("", "#N/A", "nan", "NaN", "(blank)", "-"):
+        return np.nan
+    s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") >= 1 else s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def carregar_base(caminho):
+    df = pd.read_csv(caminho, sep=SEP, dtype=str, engine="python")
+    df.columns = [c.strip() for c in df.columns]
+
+    # Remove linhas de totalizacao / lixo
+    df = df[~df["chave"].astype(str).str.contains("Grand Total", na=False)]
+    df = df[df["chave"].notna() & (df["chave"].astype(str).str.strip() != "")]
+    df = df[df["chave"].astype(str).str.strip() != "(blank)"]
+
+    # EAN padronizado: 13 primeiros digitos da chave
+    df["EAN"] = df["chave"].astype(str).str.replace(r"\D", "", regex=True).str[:13]
+    df = df[df["EAN"].str.len() == 13]
+
+    # Conversao numerica
+    for c in COLS_NUMERICAS:
+        if c in df.columns:
+            df[c] = df[c].apply(limpar_numero)
+
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce")
+    df["MÊS"] = pd.to_numeric(df["MÊS"], errors="coerce")
+
+    # Flag de periodo DLI: coluna dli marcada com 'y'
+    df["is_dli"] = df["dli"].astype(str).str.strip().str.lower() == "y"
+
+    # Identificador da sazonalidade (ano da DLI)
+    df["safra_dli"] = np.where(df["is_dli"], df["ANO"], np.nan)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 2. BASELINE E INCREMENTALIDADE POR EAN
+# ---------------------------------------------------------------------------
+def calcular_baseline(df):
+    """Media dos periodos fora da DLI por EAN."""
+    base = df[~df["is_dli"]].copy()
+    agg = base.groupby("EAN").agg(
+        sellout_base=("sellout", "mean"),
+        inv_base=("Sum of investimento", "mean"),
+        vol_base=("Sum of Qtd Vendida", "mean"),
+        preco_base=("preco/it", "mean"),
+    ).reset_index()
+    return agg
+
+
+def perfil_produto(df):
+    """Atributos descritivos por EAN (moda / primeiro valor valido)."""
+    def primeiro_valido(s):
+        s = s[s.astype(str).str.strip().replace({"#N/A": np.nan, "(blank)": np.nan}).notna()]
+        return s.iloc[0] if len(s) else np.nan
+
+    return df.groupby("EAN").agg(
+        PRODUTO=("PRODUTO", primeiro_valido),
+        CATEGORIA=("CATEGORIA", primeiro_valido),
+        SUB=("SUB", primeiro_valido),
+    ).reset_index()
+
+
+def calcular_dli_por_safra(df):
+    """Metricas medias na DLI, por EAN e safra."""
+    dli = df[df["is_dli"]].copy()
+    agg = dli.groupby(["EAN", "safra_dli"]).agg(
+        sellout_dli=("sellout", "mean"),
+        inv_dli=("Sum of investimento", "mean"),
+        vol_dli=("Sum of Qtd Vendida", "mean"),
+        preco_dli=("preco/it", "mean"),
+    ).reset_index()
+    return agg
+
+
+def montar_incrementalidade(df):
+    base = calcular_baseline(df)
+    dli = calcular_dli_por_safra(df)
+    perfil = perfil_produto(df)
+
+    m = dli.merge(base, on="EAN", how="left").merge(perfil, on="EAN", how="left")
+
+    # Incrementos por safra
+    m["dQ"] = m["vol_dli"] - m["vol_base"]
+    m["dSellout"] = m["sellout_dli"] - m["sellout_base"]
+    m["dInv"] = m["inv_dli"] - m["inv_base"]
+
+    # Desconto historico praticado na DLI (vs preco base)
+    m["desc_hist"] = np.where(
+        m["preco_base"] > 0,
+        1.0 - (m["preco_dli"] / m["preco_base"]),
+        np.nan,
+    )
+    m["desc_hist"] = m["desc_hist"].clip(lower=0.0)  # desconto negativo = sem desconto
+    return m
+
+
+# ---------------------------------------------------------------------------
+# 3. TETO GLOBAL (VERBA BRUTA DA ULTIMA DLI)
+# ---------------------------------------------------------------------------
+def teto_global(df, incr):
+    """
+    Teto de orcamento = verba BRUTA total investida na ultima DLI realizada.
+    Como no modelo verba=desconto o investimento e a propria verba bruta
+    (d * preco * volume total), a comparacao teto-vs-alocacao e bruto contra
+    bruto. Retorna tambem a verba bruta por safra (para o resumo) e o ano da
+    ultima DLI usado como referencia.
+    """
+    bruto_por_safra = df[df["is_dli"]].groupby("ANO")["Sum of investimento"].sum()
+    ultima = int(bruto_por_safra.index.max())
+    teto = float(bruto_por_safra.loc[ultima])
+    return teto, bruto_por_safra, ultima
+
+
+# ---------------------------------------------------------------------------
+# 4. CONSOLIDACAO POR EAN (MEDIA DAS SAFRAS) + LIMITES DE DESCONTO
+# ---------------------------------------------------------------------------
+def consolidar_por_ean(incr):
+    g = incr.groupby("EAN")
+    cons = g.agg(
+        PRODUTO=("PRODUTO", "first"),
+        CATEGORIA=("CATEGORIA", "first"),
+        SUB=("SUB", "first"),
+        preco_base=("preco_base", "mean"),
+        vol_base=("vol_base", "mean"),
+        inv_base=("inv_base", "mean"),
+        sellout_base=("sellout_base", "mean"),
+        dQ=("dQ", "mean"),
+        dSellout=("dSellout", "mean"),
+        dInv=("dInv", "mean"),
+        desc_min_hist=("desc_hist", "min"),
+        desc_max_hist=("desc_hist", "max"),
+        n_safras=("safra_dli", "nunique"),
+    ).reset_index()
+
+    # Desconto historico de referencia (ancora do modelo de resposta de volume)
+    ref = incr.groupby("EAN")["desc_hist"].mean().rename("desc_ref").reset_index()
+    cons = cons.merge(ref, on="EAN", how="left")
+    cons["desc_ref"] = cons["desc_ref"].fillna(
+        (cons["desc_min_hist"] + cons["desc_max_hist"]) / 2.0
+    ).clip(lower=0.01, upper=0.49)
+
+    # Preco praticado na ULTIMA DLI em que cada EAN participou (e o ano dessa DLI).
+    # Usa a maior safra_dli de cada EAN e o preco medio praticado nela.
+    idx_ult = incr.groupby("EAN")["safra_dli"].transform("max")
+    ult = incr[incr["safra_dli"] == idx_ult]
+    preco_ult = ult.groupby("EAN").agg(
+        preco_ult_dli=("preco_dli", "mean"),
+        ano_ult_dli=("safra_dli", "max"),
+    ).reset_index()
+    cons = cons.merge(preco_ult, on="EAN", how="left")
+
+    # Faixa de desconto flexibilizada (+/- 20%), travada em 50% pela regra de ROI
+    cons["desc_min"] = (cons["desc_min_hist"] * (1 - FAIXA_DESCONTO_FLEX)).clip(lower=0.0)
+    cons["desc_max"] = (cons["desc_max_hist"] * (1 + FAIXA_DESCONTO_FLEX)).clip(upper=DESCONTO_MAX_ROI)
+    cons["desc_max"] = np.maximum(cons["desc_max"], cons["desc_min"])
+    return cons
+
+
+# ---------------------------------------------------------------------------
+# 4b. MODELO DE RESPOSTA (VERBA = DESCONTO)
+# ---------------------------------------------------------------------------
+def volume_incremental(d, desc_ref, q_ref, e=ELASTICIDADE_BASE):
+    """
+    Volume incremental projetado ao desconto d, ancorado no ponto historico:
+        dQ(d) = dQ_ref * ((1 - d) / (1 - desc_ref)) ** e     [e < 0]
+    Monotonica crescente em d, portanto o desconto otimo de cada EAN e sempre
+    o maior permitido -- a elasticidade so escala a projecao, nao muda a escolha.
+    """
+    denom = np.where((1 - desc_ref) > 0, (1 - desc_ref), 1.0)
+    return np.maximum(q_ref, 0.0) * ((1 - d) / denom) ** e
+
+
+def verba_desconto(d, preco_base, vol_base, dq):
+    """
+    Investimento = verba de desconto concedida sobre o volume TOTAL vendido:
+        Inv(d) = d * preco_base * (vol_base + dQ(d))
+    Endogena ao desconto por dois canais: a aliquota d e o volume que ela gera.
+    """
+    vol_total = np.maximum(vol_base, 0.0) + np.maximum(dq, 0.0)
+    return d * preco_base * vol_total
+
+
+def sellout_incremental(d, preco_base, vol_base, sellout_base, dq):
+    """
+    Sell-out incremental ao desconto d:
+        dSellout(d) = preco_base * (1 - d) * (vol_base + dQ(d)) - sellout_base
+    Sobe com o volume que o desconto gera, mas cai com a queda de preco (1 - d);
+    tem, portanto, um maximo interior -- nao e monotonico em d.
+    """
+    vol_total = np.maximum(vol_base, 0.0) + np.maximum(dq, 0.0)
+    return preco_base * (1 - d) * vol_total - sellout_base
+
+
+def inv_incremental(d, preco_base, vol_base, inv_base, dq):
+    """dInv(d) = verba de desconto(d) - investimento medio fora da DLI."""
+    return verba_desconto(d, preco_base, vol_base, dq) - inv_base
+
+
+def desconto_eficiencia_maxima(row, elasticidade, d_min, d_max):
+    """
+    Retorna o desconto em [d_min, d_max] que maximiza a EFICIENCIA incremental
+    dSellout(d) / dInv(d), junto com as metricas nesse ponto. Exige dInv > 0 e
+    dSellout > 0 (ativacao que custa verba incremental e gera sell-out acima do
+    baseline). Se nenhum ponto satisfizer, retorna None -- EAN inelegivel.
+    Varredura fina na faixa (a razao nao e convexa; busca direta e robusta).
+    """
+    if d_max <= d_min:
+        return None
+    grid = np.linspace(d_min, d_max, 121)
+    melhor = None
+    for d in grid:
+        dq = volume_incremental(d, row["desc_ref"], max(row["dQ"], 0), elasticidade)
+        dso = sellout_incremental(d, row["preco_base"], row["vol_base"], row["sellout_base"], dq)
+        dinv = inv_incremental(d, row["preco_base"], row["vol_base"], row["inv_base"], dq)
+        if dinv > 0 and dso > 0:
+            efic = dso / dinv
+            if melhor is None or efic > melhor["efic"]:
+                melhor = {"d": float(d), "dSellout": float(dso), "dInv": float(dinv),
+                          "dQ": float(dq), "efic": float(efic)}
+    return melhor
+
+
+# ---------------------------------------------------------------------------
+# 5. OTIMIZACAO (VERBA = DESCONTO, KNAPSACK SOB ORCAMENTO ENDOGENO)
+# ---------------------------------------------------------------------------
+def otimizar(cons, teto, elasticidade=ELASTICIDADE_BASE):
+    """
+    Objetivo: maximizar o sell-out incremental da carteira. Cada EAN ativado
+    recebe o desconto de MAXIMA EFICIENCIA incremental (dSellout/dInv) dentro da
+    sua faixa; a carteira e ordenada por essa eficiencia e preenchida ate o teto,
+    o que maximiza o ROI incremental total por construcao.
+
+    Metas de carteira (verificadas ao final, em relatorio a parte): ROI
+    incremental total e sell-out incremental total acima da ultima DLI. A
+    alocacao pausa antes de ativar um EAN que derrubaria o ROI incremental total
+    abaixo de ROIIC_MIN.
+
+    Regras de negocio mantidas:
+    - PISO DE DESCONTO COMPETITIVO: desconto candidato abaixo de
+      DESCONTO_MIN_COMPETITIVO -> EAN cortado (exceto protegidos).
+    - SUBCATEGORIAS PROTEGIDAS: entram antes dos demais e nao sao cortadas por
+      eficiencia nem pelo piso; limitadas a SHARE_MAX_SUB_PROTEGIDA do teto.
+    - CATEGORIAS_DESCARTADAS: fora da analise (flag reativavel).
+    """
+    df = cons.copy()
+
+    # Teto efetivo = menor entre o teto historico e o limite absoluto de
+    # investimento total (verba bruta), quando este ultimo estiver definido.
+    if INVESTIMENTO_TOTAL_MAX is not None:
+        teto = min(teto, INVESTIMENTO_TOTAL_MAX)
+
+    # Descarta categorias marcadas nesta rodada (flag reativavel)
+    df = df[~df["CATEGORIA"].isin(CATEGORIAS_DESCARTADAS)].copy()
+
+    # Protecao: por subcategoria OU por categoria estrategica
+    df["protegido"] = df["SUB"].isin(SUBS_PROTEGIDAS) | df["CATEGORIA"].isin(CATEGORIAS_PROTEGIDAS)
+
+    # Desconto de maxima eficiencia incremental (dSellout/dInv) por EAN, dentro
+    # da faixa [desc_min, min(desc_max, 50%)]. Protegidos: piso competitivo mais alto.
+    registros = []
+    for _, row in df.iterrows():
+        d_lo = row["desc_min"]
+        d_hi = min(row["desc_max"], DESCONTO_MAX_ROI)
+        if row["protegido"]:
+            d_lo = max(d_lo, DESCONTO_MIN_COMPETITIVO)
+        best = desconto_eficiencia_maxima(row, elasticidade, d_lo, d_hi)
+        if best is None:
+            registros.append({"EAN": row["EAN"], "d_star": np.nan, "dQ_star": np.nan,
+                              "dSellout_star": np.nan, "dInv_star": np.nan,
+                              "efic_inc": np.nan, "viavel": False})
+        else:
+            registros.append({"EAN": row["EAN"], "d_star": best["d"], "dQ_star": best["dQ"],
+                              "dSellout_star": best["dSellout"], "dInv_star": best["dInv"],
+                              "efic_inc": best["efic"], "viavel": True})
+    reg = pd.DataFrame(registros)
+    df = df.merge(reg, on="EAN", how="left")
+
+    df["verba_star"] = verba_desconto(
+        df["d_star"], df["preco_base"], df["vol_base"], df["dQ_star"]
+    )
+
+    # Piso competitivo (exceto protegidos) e viabilidade incremental
+    acima_piso = df["d_star"] >= DESCONTO_MIN_COMPETITIVO
+    df["elegivel"] = df["viavel"].fillna(False) & (acima_piso | df["protegido"])
+
+    # Ordena: protegidos primeiro, depois por eficiencia incremental (dSellout/dInv)
+    elegiveis = df[df["elegivel"]].sort_values(
+        ["protegido", "efic_inc"], ascending=[False, False]
+    ).copy()
+
+    piso = PISO_ORCAMENTO * teto
+    teto_sub_prot = SHARE_MAX_SUB_PROTEGIDA * teto   # limite de verba por SUB protegida
+    orcamento_usado = 0.0
+    gasto_sub = {}                                    # verba acumulada por SUB protegida
+    status, inv_alocado, vol_proj, desc_final = {}, {}, {}, {}
+    soma_dso, soma_dinv = 0.0, 0.0                     # acumuladores de ROI incremental total
+
+    def _ativa(ean, d, dq, preco_base, vol_base, protegido, rotulo):
+        verba = verba_desconto(d, preco_base, vol_base, dq)
+        status[ean] = rotulo
+        inv_alocado[ean] = verba
+        vol_proj[ean] = dq
+        desc_final[ean] = d
+        return verba
+
+    def _corta(ean):
+        status[ean] = "Cortado"
+        inv_alocado[ean] = 0.0
+        vol_proj[ean] = 0.0
+        desc_final[ean] = 0.0
+
+    for _, row in elegiveis.iterrows():
+        ean = row["EAN"]
+        custo = row["verba_star"]
+        prot = bool(row["protegido"])
+        sub = row["SUB"]
+
+        # Espaco disponivel = restante global E, para SUB protegida, o sub-teto.
+        restante = teto - orcamento_usado
+        if prot and sub in SUBS_PROTEGIDAS:
+            restante = min(restante, teto_sub_prot - gasto_sub.get(sub, 0.0))
+
+        # Nao cabe inteiro no desconto de eficiencia maxima -> corta (mantem cada
+        # ativado no seu desconto otimo, sem degradar a eficiencia para caber).
+        if restante <= 0 or custo > restante + 1e-6:
+            _corta(ean)
+            continue
+
+        # Guarda de ROI incremental total: nao ativa se derrubar o ROIic total
+        # abaixo do minimo. Protegidos entram mesmo assim (presenca mandatoria).
+        novo_dso = soma_dso + row["dSellout_star"]
+        novo_dinv = soma_dinv + row["dInv_star"]
+        roi_novo = novo_dso / novo_dinv if novo_dinv > 0 else np.inf
+        if (not prot) and roi_novo < ROIIC_MIN:
+            _corta(ean)
+            continue
+
+        rotulo = "Ativado na DLI (protegido)" if prot else "Ativado na DLI"
+        v = _ativa(ean, row["d_star"], row["dQ_star"],
+                   row["preco_base"], row["vol_base"], prot, rotulo)
+        orcamento_usado += v
+        soma_dso, soma_dinv = novo_dso, novo_dinv
+        if prot and sub in SUBS_PROTEGIDAS:
+            gasto_sub[sub] = gasto_sub.get(sub, 0.0) + v
+
+    # Nao elegiveis -> cortados
+    for _, row in df[~df["elegivel"]].iterrows():
+        _corta(row["EAN"])
+
+    df["Status"] = df["EAN"].map(status)
+    df["inv_bruto_alocado"] = df["EAN"].map(inv_alocado)
+    df["vol_incremental_projetado"] = df["EAN"].map(vol_proj)
+    df["desconto_recomendado"] = df["EAN"].map(desc_final)
+    df["preco_proposto"] = df["preco_base"] * (1.0 - df["desconto_recomendado"])
+
+    # Metricas incrementais no desconto recomendado (0 para cortados)
+    ativo = df["Status"].str.startswith("Ativado").fillna(False)
+    dq_rec = df["vol_incremental_projetado"]
+    df["sellout_incremental"] = np.where(
+        ativo,
+        sellout_incremental(df["desconto_recomendado"], df["preco_base"],
+                            df["vol_base"], df["sellout_base"], dq_rec),
+        0.0,
+    )
+    df["roi_incremental"] = np.where(
+        ativo & (df["inv_bruto_alocado"] > 0),
+        df["sellout_incremental"] / (
+            df["inv_bruto_alocado"] - df["inv_base"]
+        ).where(lambda s: s > 0, np.nan),
+        np.nan,
+    )
+
+    return df, orcamento_usado, piso
+
+
+def _desconto_para_verba(row, verba_alvo, elasticidade):
+    """
+    Menor desconto (<= d_star) cuja verba resultante == verba_alvo.
+    Verba(d) e crescente em d, entao ha solucao unica por busca binaria simples.
+    """
+    lo, hi = row["desc_min"], row["d_star"]
+    if hi <= lo:
+        return lo
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        dq = volume_incremental(mid, row["desc_ref"], max(row["dQ"], 0), elasticidade)
+        v = verba_desconto(mid, row["preco_base"], row["vol_base"], dq)
+        if v > verba_alvo:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+# ---------------------------------------------------------------------------
+# 6. SAIDAS
+# ---------------------------------------------------------------------------
+def montar_tabela_detalhe(df):
+    ativo = df["Status"].str.startswith("Ativado").fillna(False)
+
+    # Volume total na DLI e sell-out bruto na DLI (0 para cortados)
+    vol_dli = np.where(ativo, df["vol_base"] + df["vol_incremental_projetado"], 0.0)
+    sellout_bruto_dli = np.where(ativo, df["preco_proposto"] * vol_dli, 0.0)
+    inv_incremental = np.where(ativo, df["inv_bruto_alocado"] - df["inv_base"], 0.0)
+
+    out = pd.DataFrame({
+        "EAN": df["EAN"],
+        "Produto": df["PRODUTO"],
+        "Categoria": df["CATEGORIA"],
+        "Subcategoria": df["SUB"],
+        "Status": df["Status"],
+        # --- Precos: fora da DLI, ultima DLI praticada, e sugerido ---
+        "Preco Fora DLI (R$)": df["preco_base"].round(2),
+        "Preco Ultima DLI (R$)": df["preco_ult_dli"].round(2),
+        "Ano Ultima DLI": df["ano_ult_dli"],
+        "Desc Min Hist ±20% (%)": (df["desc_min"] * 100).round(1),
+        "Desc Max Hist ±20% (%)": (df["desc_max"] * 100).round(1),
+        "Desconto Recomendado (%)": (df["desconto_recomendado"] * 100).round(1),
+        "Preco Sugerido (R$)": df["preco_proposto"].round(2),
+        # --- Fora da DLI (baseline, media mensal) - referencia de comparacao ---
+        "Volume Fora DLI (un)": df["vol_base"].round(0),
+        "Sell-Out Fora DLI (R$)": df["sellout_base"].round(2),
+        "Investimento Fora DLI (R$)": df["inv_base"].round(2),
+        # --- Na DLI (bruto, media mensal) ---
+        "Volume DLI (un)": np.round(vol_dli, 0),
+        "Sell-Out Bruto DLI (R$)": np.round(sellout_bruto_dli, 2),
+        "Investimento Bruto DLI (R$)": df["inv_bruto_alocado"].round(2),
+        # --- Incremental (DLI - baseline) ---
+        "Volume Incremental (un)": df["vol_incremental_projetado"].round(0),
+        "Sell-Out Incremental (R$)": df["sellout_incremental"].round(2),
+        "Investimento Incremental (R$)": np.round(inv_incremental, 2),
+        # --- ROI incremental = sell-out incremental / investimento incremental ---
+        "ROI Incremental": np.where(
+            ativo & (inv_incremental > 0),
+            np.round(df["sellout_incremental"] / np.where(inv_incremental > 0, inv_incremental, np.nan), 2),
+            np.nan,
+        ),
+        "N Safras Historico": df["n_safras"],
+    })
+    return out.sort_values(["Status", "Investimento Bruto DLI (R$)"], ascending=[True, False])
+
+
+def montar_resumo_executivo(df):
+    ativo = df["Status"].str.startswith("Ativado")
+    vol_dli = np.where(ativo, df["vol_base"] + df["vol_incremental_projetado"], 0.0)
+    df = df.assign(
+        _ativado=ativo.astype(int),
+        _cortado=(~ativo).astype(int),
+        _inv_incremental=np.where(ativo, (df["inv_bruto_alocado"] - df["inv_base"]).clip(lower=0), 0.0),
+        _sellout_bruto_dli=np.where(ativo, df["preco_proposto"] * vol_dli, 0.0),
+        _sellout_base=np.where(ativo, df["sellout_base"], 0.0),
+        _inv_base=np.where(ativo, df["inv_base"], 0.0),
+    )
+
+    resumo = df.groupby(["CATEGORIA", "SUB"]).agg(
+        EANs_Ativados=("_ativado", "sum"),
+        EANs_Cortados=("_cortado", "sum"),
+        Sellout_Base_fora_DLI=("_sellout_base", "sum"),
+        Investimento_Base_fora_DLI=("_inv_base", "sum"),
+        Sellout_Bruto_DLI=("_sellout_bruto_dli", "sum"),
+        Investimento_Bruto=("inv_bruto_alocado", "sum"),
+        Sellout_Incremental_Total=("sellout_incremental", "sum"),
+        Investimento_Incremental=("_inv_incremental", "sum"),
+        Volume_Incremental_Total=("vol_incremental_projetado", "sum"),
+    ).reset_index()
+
+    total_inv = resumo["Investimento_Bruto"].sum()
+    resumo["Share Investimento (%)"] = np.where(
+        total_inv > 0, (resumo["Investimento_Bruto"] / total_inv * 100).round(1), 0.0
+    )
+    # ROI incremental = sell-out incremental / investimento INCREMENTAL
+    resumo["ROI Incremental"] = np.where(
+        resumo["Investimento_Incremental"] > 0,
+        (resumo["Sellout_Incremental_Total"] / resumo["Investimento_Incremental"]).round(2),
+        np.nan,
+    )
+    for c in ["Sellout_Base_fora_DLI", "Investimento_Base_fora_DLI", "Sellout_Bruto_DLI",
+              "Investimento_Bruto", "Sellout_Incremental_Total", "Investimento_Incremental"]:
+        resumo[c] = resumo[c].round(2)
+    resumo["Volume_Incremental_Total"] = resumo["Volume_Incremental_Total"].round(0)
+    resumo["Sellout_Incremental_Total"] = resumo["Sellout_Incremental_Total"].round(2)
+
+    return resumo.sort_values("Share Investimento (%)", ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# EXECUCAO
+# ---------------------------------------------------------------------------
+def main():
+    df = carregar_base(ARQUIVO)
+    incr = montar_incrementalidade(df)
+    teto, por_safra, ultima = teto_global(df, incr)
+    cons = consolidar_por_ean(incr)
+    resultado, usado, piso = otimizar(cons, teto)
+
+    detalhe = montar_tabela_detalhe(resultado)
+    executivo = montar_resumo_executivo(resultado)
+
+    detalhe.to_excel(SAIDA_DETALHE, index=False)
+    executivo.to_excel(SAIDA_EXEC, index=False)
+
+    n_ativos = resultado["Status"].str.startswith("Ativado").sum()
+    n_cortados = (resultado["Status"] == "Cortado").sum()
+
+    print("=" * 70)
+    print("RESUMO DA OTIMIZACAO DLI")
+    print("=" * 70)
+    print(f"EANs elegiveis analisados : {len(resultado)}")
+    print(f"EANs ativados             : {n_ativos}")
+    print(f"EANs cortados             : {n_cortados}")
+    teto_efetivo = min(teto, INVESTIMENTO_TOTAL_MAX) if INVESTIMENTO_TOTAL_MAX is not None else teto
+    print(f"Teto global (bruto DLI {ultima}) : R$ {teto:,.2f}")
+    if INVESTIMENTO_TOTAL_MAX is not None and INVESTIMENTO_TOTAL_MAX < teto:
+        print(f"Teto efetivo (limite total)      : R$ {teto_efetivo:,.2f}  <- restricao ativa")
+    print(f"Piso (70% do teto efetivo)       : R$ {piso:,.2f}")
+    print(f"Investimento BRUTO total alocado : R$ {usado:,.2f}  ({usado/teto_efetivo*100:.1f}% do teto efetivo)")
+    print(f"  (limite: bruto < R$ {INVESTIMENTO_TOTAL_MAX:,.0f} -> {'SIM' if INVESTIMENTO_TOTAL_MAX is None or usado < INVESTIMENTO_TOTAL_MAX else 'NAO'})")
+    inc_total = (resultado.loc[resultado['Status'].str.startswith('Ativado'), 'inv_bruto_alocado']
+                 - resultado.loc[resultado['Status'].str.startswith('Ativado'), 'inv_base']).clip(lower=0).sum()
+    print(f"Investimento INCREMENTAL total   : R$ {inc_total:,.2f}  (bruto - baseline)")
+    print(f"Piso atendido             : {'SIM' if usado >= piso else 'NAO'}")
+    print("\nVerba bruta por DLI historica:")
+    for safra, val in por_safra.items():
+        marca = "  <- teto" if int(safra) == ultima else ""
+        print(f"  {int(safra)}: R$ {val:,.2f}{marca}")
+
+    # --- Metas de carteira vs. ultima DLI (incremental) ---
+    ativ = resultado[resultado["Status"].str.startswith("Ativado")]
+    so_prop = ativ["sellout_incremental"].sum()
+    dinv_prop = (ativ["inv_bruto_alocado"] - ativ["inv_base"]).clip(lower=0).sum()
+    roi_prop = so_prop / dinv_prop if dinv_prop > 0 else float("nan")
+
+    ult_incr = incr[incr["safra_dli"] == ultima]
+    so_ult = ult_incr["dSellout"].sum()
+    dinv_ult = ult_incr["dInv"].clip(lower=0).sum()
+    roi_ult = so_ult / dinv_ult if dinv_ult > 0 else float("nan")
+
+    print("\n" + "-" * 70)
+    print(f"METAS DE CARTEIRA (vs. ultima DLI {ultima})")
+    print(f"  Sell-out incremental : R$ {so_prop:,.0f}  vs  R$ {so_ult:,.0f}"
+          f"   {'ATINGIDA' if so_prop > so_ult else 'NAO ATINGIDA'}")
+    print(f"  ROI incremental total: {roi_prop:.3f}  vs  {roi_ult:.3f}"
+          f"   {'ATINGIDA' if roi_prop > roi_ult else 'NAO ATINGIDA'}")
+    print(f"  ROI incremental >= {ROIIC_MIN}: {'SIM' if roi_prop >= ROIIC_MIN else 'NAO'}")
+    print("=" * 70)
+    return resultado, detalhe, executivo
+
+
+if __name__ == "__main__":
+    main()
