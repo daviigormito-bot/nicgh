@@ -1,0 +1,115 @@
+"""
+Analise de Sensibilidade para DLI - Modelo Verba-como-Desconto
+Complemento ao otimizador_dli.py
+
+CONTEXTO DO MODELO:
+O investimento e a propria verba de desconto: Inv(d) = d * preco_base * Q(d),
+endogena ao desconto. Como Q(d) e monotonica crescente em d, o desconto otimo
+de cada EAN e sempre o maior permitido (min(faixa_max, 50%)) -- a ESCOLHA de
+desconto NAO depende da elasticidade. A trava de ROI de sell-out >= 1 equivale
+exatamente a d <= 50%, pois ROI = (1-d)/d.
+
+PAPEL DA ELASTICIDADE:
+A elasticidade governa apenas a PROJECAO: quanto volume (e portanto quanta
+verba) cada desconto gera. Nao ha base estatistica para estima-la por EAN
+(dados anuais insuficientes, ver otimizador), entao rodamos tres cenarios de
+premissa e reotimizamos a alocacao em cada um. O que muda entre cenarios nao e
+o desconto de um EAN isolado, e sim QUANTOS EANs cabem no teto: com elasticidade
+maior, cada desconto gera mais volume e mais verba, o teto enche mais rapido e
+menos EANs sao ativados (ou com desconto reduzido para caber).
+"""
+
+import numpy as np
+import pandas as pd
+
+import otimizador_dli as base
+
+CENARIOS = {
+    "Conservador": -0.6,
+    "Base":        -1.2,
+    "Agressivo":   -2.0,
+}
+
+
+def rodar_cenarios(incr, teto):
+    """Reotimiza a alocacao inteira sob cada premissa de elasticidade."""
+    linhas_resumo = []
+    detalhe_por_cenario = {}
+
+    for nome, e in CENARIOS.items():
+        cons = base.consolidar_por_ean(incr)
+        res, usado, piso = base.otimizar(cons, teto, elasticidade=e)
+        ativo = res["Status"].str.startswith("Ativado")
+
+        detalhe_por_cenario[nome] = res
+
+        linhas_resumo.append({
+            "Cenario": nome,
+            "Elasticidade": e,
+            "EANs Ativados": int(ativo.sum()),
+            "EANs Cortados": int((~ativo).sum()),
+            "Desconto Medio (%)": round(res.loc[ativo, "desconto_recomendado"].mean() * 100, 1),
+            "Verba Alocada (R$)": round(usado, 0),
+            "% do Teto": round(usado / teto * 100, 1),
+            "Volume Incremental (un)": round(res.loc[ativo, "vol_incremental_projetado"].sum(), 0),
+        })
+
+    return pd.DataFrame(linhas_resumo), detalhe_por_cenario
+
+
+def montar_tabela_ean(detalhe):
+    """Compara, por EAN, desconto e volume projetado entre os tres cenarios."""
+    base_df = detalhe["Base"][["EAN", "PRODUTO", "CATEGORIA", "SUB", "preco_base"]].copy()
+    for nome in CENARIOS:
+        d = detalhe[nome][["EAN", "desconto_recomendado", "vol_incremental_projetado", "Status"]]
+        d = d.rename(columns={
+            "desconto_recomendado": f"desc_{nome}",
+            "vol_incremental_projetado": f"vol_{nome}",
+            "Status": f"status_{nome}",
+        })
+        base_df = base_df.merge(d, on="EAN", how="left")
+
+    tab = pd.DataFrame({
+        "EAN": base_df["EAN"],
+        "Produto": base_df["PRODUTO"],
+        "Categoria": base_df["CATEGORIA"],
+        "Subcategoria": base_df["SUB"],
+        "Preco Base (R$)": base_df["preco_base"].round(2),
+        "Desc Conservador (%)": (base_df["desc_Conservador"] * 100).round(1),
+        "Desc Base (%)": (base_df["desc_Base"] * 100).round(1),
+        "Desc Agressivo (%)": (base_df["desc_Agressivo"] * 100).round(1),
+        "Vol Conservador (un)": base_df["vol_Conservador"].round(0),
+        "Vol Base (un)": base_df["vol_Base"].round(0),
+        "Vol Agressivo (un)": base_df["vol_Agressivo"].round(0),
+        "Status Base": base_df["status_Base"],
+    })
+    tab["Amplitude Vol (un)"] = (tab["Vol Agressivo (un)"] - tab["Vol Conservador (un)"]).round(0)
+    return tab.sort_values("Amplitude Vol (un)", ascending=False)
+
+
+def main():
+    df = base.carregar_base(base.ARQUIVO)
+    incr = base.montar_incrementalidade(df)
+    teto, _, _ = base.teto_global(df, incr)
+
+    resumo, detalhe = rodar_cenarios(incr, teto)
+    tab = montar_tabela_ean(detalhe)
+
+    saida = "/mnt/user-data/outputs/dli_sensibilidade_cenarios.xlsx"
+    tab.to_excel(saida, index=False)
+
+    print("=" * 70)
+    print("SENSIBILIDADE POR CENARIOS DE ELASTICIDADE - VERBA=DESCONTO")
+    print("=" * 70)
+    print(resumo.to_string(index=False))
+    print("-" * 70)
+    print("Leitura: elasticidade maior => cada desconto gera mais volume e mais")
+    print("verba => teto enche mais rapido => menos EANs ativados. O desconto de")
+    print("cada EAN e o de MAXIMA EFICIENCIA incremental; a elasticidade so move")
+    print("esse ponto e a projecao de sell-out, nao a estrutura da decisao.")
+    print("=" * 70)
+    return resumo, tab
+
+
+if __name__ == "__main__":
+    main()
