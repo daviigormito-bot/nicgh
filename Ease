@@ -1,0 +1,745 @@
+"""
+Otimizador DLI - versao consenso estatistico
+Objetivo: MAXIMIZAR o sell-out incremental da carteira.
+Restricao dura: investimento BRUTO estimado da proxima DLI <= INVESTIMENTO_TOTAL_MAX.
+
+Metodo:
+  1) Elasticidade within-EAN + shrinkage James-Stein por SUB (cluster-robust)
+  2) Preco base = ultimo ano fiscal * (1+REAJUSTE_PRECO); ancoras recalculadas
+  3) dQ negativo tratado com shrink para a media da SUB (nao zerado)
+  4) K unico por MG5; alocacao por multiplicador de Lagrange sobre o inv. BRUTO
+Regras: ROI incremental > 1 por EAN; preco nao abaixo da ultima DLI de cada item;
+mes 11 fora do baseline; baseline por ano fiscal (jul-jun); nada protegido.
+
+Como rodar:
+  python otimizador_consenso.py "C:\\caminho\\base.xlsx"
+  (ou preencha CAMINHO_BASE abaixo, ou deixe um unico .xlsx/.txt na pasta)
+Gera: dli_resultado_consenso.xlsx com as abas
+  Recomendado (K) | Cortados | Resumo | Legenda | DLI_2026 (realizado) | Diagnostico
+"""
+import os, sys, glob, numpy as np, pandas as pd
+import statsmodels.formula.api as smf
+
+# =============================================================================
+#  >>> COLE AQUI OS CAMINHOS DOS SEUS ARQUIVOS <<<
+# =============================================================================
+# 1) Base principal (historico DLI). Deixe "" para passar na linha de comando.
+CAMINHO_BASE = ""
+
+# 2) Planilha de PRECO BASE PROJETADO da proxima DLI (colunas: EAN, max).
+#    >>> COLE O CAMINHO DA SUA PLANILHA DE PRECO AQUI, entre as aspas: <<<
+#    Ex.: CAMINHO_PRECO_BASE = r"C:\Users\voce\Desktop\precos_base.xlsx"
+#    Se um EAN nao estiver nessa planilha, o preco base dele e calculado pela
+#    conta interna (maior preco c/ >=10% share do ultimo ano fiscal x1.07).
+#    Deixe "" para nao usar planilha e calcular todos pela conta interna.
+CAMINHO_PRECO_BASE = ""
+COL_PRECO_BASE_EAN = "EAN"       # nome da coluna de EAN na sua planilha
+COL_PRECO_BASE_VAL = "max"       # nome da coluna de preco na sua planilha
+# =============================================================================
+
+SEP = "\t"
+
+def _resolver_arquivo():
+    if CAMINHO_BASE.strip(): return CAMINHO_BASE.strip().strip('"')
+    if len(sys.argv) > 1 and sys.argv[1].strip(): return sys.argv[1].strip().strip('"')
+    if os.environ.get("DLI_ARQUIVO"): return os.environ["DLI_ARQUIVO"].strip().strip('"')
+    cand = [f for f in glob.glob("*.xlsx")+glob.glob("*.txt") if not f.startswith("dli_")]
+    if len(cand) == 1: return os.path.abspath(cand[0])
+    return input("Cole o caminho da base (xlsx/txt) e tecle Enter: ").strip().strip('"')
+
+ARQUIVO = _resolver_arquivo()
+SAIDA = "dli_resultado_consenso.xlsx"
+
+INVESTIMENTO_TOTAL_MAX = 750_000.0   # TETO sobre o investimento BRUTO estimado
+PISO_ORCAMENTO = 0.70
+MESES_FORA_BASELINE = {11}
+FAIXA_T_FLEX = 0.20
+T_MAX_GLOBAL = 1.00   # sem teto de t; unico limite superior e o preco da ultima DLI
+T_MIN_COMPETITIVO = 0.02
+ELASTICIDADE_BASE = -1.2
+# Faixa de validade da elasticidade. Sem trava inferior de -4 (removida): o limite
+# superior -0.3 barra estimativas pouco elasticas/implausiveis (inclui positivas);
+# o piso -20 e apenas uma guarda numerica contra explosao, nao uma trava de negocio.
+ELAST_FAIXA = (-20.0, -0.3)
+ELAST_MIN_PONTOS = 6              # min. de observacoes para tentar estimar num nivel
+PRECO_NAO_ABAIXO_ULTIMA_DLI = True
+SUBS_PROTEGIDAS = set()           # nada protegido; tudo disputa por eficiencia
+CATEGORIAS_DESCARTADAS = set()    # nenhuma categoria excluida
+REAJUSTE_PRECO = 0.07             # reajuste do preco base (SO no fallback interno)
+
+
+
+# -----------------------------------------------------------------------------
+# CARGA TRIBUTARIA TOTAL APROXIMADA por CATEGORIA (ICMS + PIS/COFINS + IPI).
+# ATENCAO: valores de PARTIDA, estimados por faixas de mercado de higiene pessoal.
+# NAO sao apurados oficialmente -- variam por estado (ICMS), NCM, regime monofasico
+# de PIS/COFINS e estao em transicao pela reforma tributaria. VALIDAR COM O FISCAL
+# antes de uso em decisao. Chave = CATEGORIA (como aparece na base). Ajuste aqui.
+# -----------------------------------------------------------------------------
+CARGA_TRIBUTARIA = {
+    "BABY CARE": 0.28,     # fraldas/lencos - ICMS reduzido em varios estados (cesta)
+    "FEM CARE":  0.30,     # absorventes - alguns estados com reducao
+    "HAIR CARE": 0.38,     # shampoo/condicionador - higiene, sem reducao
+    "ORAL CARE": 0.35,     # creme dental/escovas
+    "SHAVE CARE":0.40,     # laminas/aparelhos
+    "APDO":      0.40,     # desodorantes
+}
+CARGA_TRIBUTARIA_DEFAULT = 0.35   # fallback p/ categoria fora do dicionario
+
+COLS_NUMERICAS = ["Sum of investimento", "Sum of Qtd Vendida", "sellout",
+                  "su", "PREÇO/su", "preco/it"]
+
+# ------------------------- carga/limpeza -------------------------
+def limpar_numero(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip()
+    if s in ("", "#N/A", "nan", "NaN", "(blank)", "-"): return np.nan
+    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>=1 else s.replace(",", ".")
+    try: return float(s)
+    except ValueError: return np.nan
+
+def _resolver_preco_base():
+    """Descobre o caminho da planilha de preco base: variavel CAMINHO_PRECO_BASE,
+    2o argumento na linha de comando, variavel de ambiente DLI_PRECO, ou um arquivo
+    com 'preco' no nome na pasta atual. Retorna "" se nada for encontrado."""
+    if CAMINHO_PRECO_BASE.strip(): return CAMINHO_PRECO_BASE.strip().strip('"')
+    if len(sys.argv) > 2 and sys.argv[2].strip(): return sys.argv[2].strip().strip('"')
+    if os.environ.get("DLI_PRECO"): return os.environ["DLI_PRECO"].strip().strip('"')
+    cand=[f for f in glob.glob("*.xlsx")+glob.glob("*.txt")+glob.glob("*.csv")
+          if "preco" in f.lower() and not f.startswith("dli_")]
+    if len(cand)==1: return os.path.abspath(cand[0])
+    return ""
+
+def carregar_precos_externos(caminho):
+    """Le a planilha externa de preco base por EAN (colunas EAN, max). Retorna
+    dict EAN(13 digitos) -> preco. Vazio se caminho nao informado ou arquivo ausente."""
+    if not caminho or not str(caminho).strip():
+        return {}
+    caminho=str(caminho).strip().strip('"')
+    if not os.path.exists(caminho):
+        print(f"[aviso] planilha de preco base nao encontrada: {caminho} -- usando fallback interno")
+        return {}
+    ext=os.path.splitext(caminho)[1].lower()
+    if ext in (".xlsx",".xls",".xlsm"):
+        dfp=pd.read_excel(caminho, dtype=str)
+    else:
+        dfp=pd.read_csv(caminho, sep=SEP, dtype=str, engine="python")
+    dfp.columns=[c.strip() for c in dfp.columns]
+    if COL_PRECO_BASE_EAN not in dfp.columns or COL_PRECO_BASE_VAL not in dfp.columns:
+        print(f"[aviso] planilha de preco base sem colunas '{COL_PRECO_BASE_EAN}'/'{COL_PRECO_BASE_VAL}' -- usando fallback")
+        return {}
+    dfp["_ean"]=dfp[COL_PRECO_BASE_EAN].astype(str).str.replace(r"\D","",regex=True).str[:13]
+    dfp["_val"]=dfp[COL_PRECO_BASE_VAL].apply(limpar_numero)
+    dfp=dfp[(dfp["_ean"].str.len()==13) & (dfp["_val"]>0)]
+    return dict(zip(dfp["_ean"], dfp["_val"]))
+
+def carregar_base(caminho):
+    ext = os.path.splitext(caminho)[1].lower()
+    if ext in (".xlsx", ".xls", ".xlsm"):
+        df = pd.read_excel(caminho, dtype=str)
+    else:
+        df = pd.read_csv(caminho, sep=SEP, dtype=str, engine="python")
+    df.columns = [c.strip() for c in df.columns]
+    df = df[~df["chave"].astype(str).str.contains("Grand Total", na=False)]
+    df = df[df["chave"].notna() & (df["chave"].astype(str).str.strip()!="")]
+    df = df[df["chave"].astype(str).str.strip()!="(blank)"]
+    df["EAN"] = df["chave"].astype(str).str.replace(r"\D","",regex=True).str[:13]
+    df = df[df["EAN"].str.len()==13]
+    for c in COLS_NUMERICAS:
+        if c in df.columns: df[c] = df[c].apply(limpar_numero)
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce")
+    df["MÊS"] = pd.to_numeric(df["MÊS"], errors="coerce")
+    df = df.dropna(subset=["ANO","MÊS"])
+    df["ANO_FISCAL"] = df["ANO"].astype(int) - (df["MÊS"] < 7).astype(int)
+    df["is_dli"] = df["dli"].astype(str).str.strip().str.lower()=="y"
+    df["is_baseline"] = (~df["is_dli"]) & (~df["MÊS"].isin(MESES_FORA_BASELINE))
+    df["safra_dli"] = np.where(df["is_dli"], df["ANO_FISCAL"], np.nan)
+    return df
+
+# ------------------------- baseline ano fiscal -------------------------
+PRECO_BASE_SHARE_MIN = 0.10   # participacao minima no sellout do ano fiscal p/ o preco entrar
+
+def baseline_af(df):
+    """Baseline por EAN e ano fiscal. sellout/inv/vol continuam medias do periodo
+    normal. O PRECO BASE muda: e o MAIOR preco/it praticado no ano fiscal, entre os
+    meses cujo sellout representa >= PRECO_BASE_SHARE_MIN do sellout do ano (evita
+    que um preco de ponta com volume irrelevante vire a base)."""
+    base = df[df["is_baseline"]].copy()
+    agg = base.groupby(["EAN","ANO_FISCAL"]).agg(
+        sellout_base=("sellout","mean"), inv_base=("Sum of investimento","mean"),
+        vol_base=("Sum of Qtd Vendida","mean"),
+    ).reset_index()
+
+    # preco base por (EAN, ano fiscal): maior preco/it com share de sellout >= 10%
+    def maior_preco_relevante(g):
+        tot=g["sellout"].sum()
+        if tot<=0:
+            return g["preco/it"].max()
+        gg=g[g["sellout"]/tot >= PRECO_BASE_SHARE_MIN]
+        gg=gg[gg["preco/it"]>0]
+        return gg["preco/it"].max() if len(gg) else g.loc[g["preco/it"]>0,"preco/it"].max()
+    pb=(base.groupby(["EAN","ANO_FISCAL"]).apply(maior_preco_relevante, include_groups=False)
+            .rename("preco_base").reset_index())
+    return agg.merge(pb, on=["EAN","ANO_FISCAL"], how="left")
+
+def perfil(df):
+    def pv(s):
+        s = s[s.astype(str).str.strip().replace({"#N/A":np.nan,"(blank)":np.nan}).notna()]
+        return s.iloc[0] if len(s) else np.nan
+    p = df.groupby("EAN").agg(PRODUTO=("PRODUTO",pv),CATEGORIA=("CATEGORIA",pv),
+                              SUB=("SUB",pv),mg5=("mg5",pv)).reset_index()
+    # EANs sem MG5 (#N/A) tratados individualmente: grupo proprio = "SOLO::<EAN>"
+    p["MG5"] = p["mg5"].fillna("").astype(str).str.strip()
+    p["MG5"] = np.where(p["MG5"].isin(["","#N/A","(blank)","nan"]), "SOLO::"+p["EAN"], p["MG5"])
+    return p.drop(columns=["mg5"])
+
+def dli_safra(df):
+    dli = df[df["is_dli"]].copy()
+    return dli.groupby(["EAN","safra_dli"]).agg(
+        sellout_dli=("sellout","mean"), inv_dli=("Sum of investimento","mean"),
+        vol_dli=("Sum of Qtd Vendida","mean"), preco_dli=("preco/it","mean"),
+    ).reset_index()
+
+def incrementalidade(df):
+    base, dli, perf = baseline_af(df), dli_safra(df), perfil(df)
+    m = dli.merge(base, left_on=["EAN","safra_dli"], right_on=["EAN","ANO_FISCAL"], how="left")
+    m = m.merge(perf, on="EAN", how="left")
+    m["dQ"] = m["vol_dli"] - m["vol_base"]
+    m["dSellout"] = m["sellout_dli"] - m["sellout_base"]
+    m["dInv"] = m["inv_dli"] - m["inv_base"]
+    m["desc_hist"] = np.where(m["preco_base"]>0, 1.0 - m["preco_dli"]/m["preco_base"], np.nan)
+    m["desc_hist"] = m["desc_hist"].clip(lower=0.0)
+    # Investimento e ACORDADO POR UNIDADE VENDIDA (R$/unidade, it). O K (taxa) e
+    # derivado: K = investimento_por_unidade / preco_base. Assim K cai quando o
+    # preco sobe (ex.: reajuste +7%), como esperado de um valor fixo por unidade.
+    m["inv_unit_hist"] = np.where(m["vol_dli"]>0, m["inv_dli"]/m["vol_dli"], np.nan)
+    m["t_hist"] = np.where(m["preco_base"]>0, m["inv_unit_hist"]/m["preco_base"], np.nan).clip(0.0,1.0)
+    m = m.dropna(subset=["preco_base","vol_base","sellout_base","inv_base"])
+    return m
+
+# ------------------------- teto -------------------------
+def teto_global(df):
+    bruto = df[df["is_dli"]].groupby("ANO_FISCAL")["Sum of investimento"].sum()
+    ultima = int(bruto.index.max())
+    teto = float(bruto.loc[ultima])
+    if INVESTIMENTO_TOTAL_MAX is not None: teto = min(teto, INVESTIMENTO_TOTAL_MAX)
+    return teto, bruto, ultima
+
+# ------------------------- PATCH 1: elasticidade within + shrink -------------------------
+def _ols_simple(sub_df, min_pontos):
+    """Elasticidade log-log (ln q ~ ln p) sobre os pontos dados. Retorna
+    (coef, se) ou (None, None) se pontos insuficientes ou sem variacao de preco."""
+    p = np.log(sub_df["preco/it"].values.astype(float))
+    q = np.log(sub_df["Sum of Qtd Vendida"].values.astype(float))
+    if len(p) < min_pontos or np.ptp(p) < 1e-6:
+        return None, None
+    try:
+        m = smf.ols("q ~ p", pd.DataFrame({"p":p,"q":q})).fit()
+        return float(m.params["p"]), float(m.bse["p"])
+    except Exception:
+        return None, None
+
+def elasticidade_within(df):
+    """Elasticidade-preco por EAN com hierarquia de fallback e ORIGEM registrada:
+        1-EAN  -> estimada nos proprios pontos do EAN (dispersao temporal)
+        2-SUB  -> within-EAN dentro da SUB, com shrinkage p/ o global
+        3-CATEGORIA -> within-EAN dentro da CATEGORIA, com shrinkage p/ o global
+        4-global -> elasticidade global within (ultimo recurso)
+    'Valida' = dentro de ELAST_FAIXA (sem trava inferior de -4; so teto -0.3 e
+    piso numerico -20). Retorna dict EAN -> (elasticidade, origem)."""
+    d = df.dropna(subset=["preco/it","Sum of Qtd Vendida","EAN","SUB","CATEGORIA"]).copy()
+    d = d[(d["preco/it"]>0)&(d["Sum of Qtd Vendida"]>0)]
+    lo,hi=ELAST_FAIXA
+    def valido(e): return e is not None and lo <= e <= hi
+
+    # within-EAN centrado (remove nivel de cada produto) para SUB/CATEGORIA/global
+    d["lp"]=np.log(d["preco/it"]); d["lq"]=np.log(d["Sum of Qtd Vendida"])
+    d["lp_c"]=d["lp"]-d.groupby("EAN")["lp"].transform("mean")
+    d["lq_c"]=d["lq"]-d.groupby("EAN")["lq"].transform("mean")
+
+    # nivel 4: global within (cluster-robust por EAN)
+    dd=d[d["lp_c"].abs()>1e-9]
+    if len(dd)>ELAST_MIN_PONTOS and dd["EAN"].nunique()>1:
+        gm=smf.ols("lq_c ~ lp_c",dd).fit(cov_type="cluster",cov_kwds={"groups":dd["EAN"]})
+        e_glob=float(np.clip(gm.params["lp_c"],lo,hi))
+    else:
+        e_glob=ELASTICIDADE_BASE
+
+    # nivel 2 e 3: estimativa within por SUB e por CATEGORIA (+ shrinkage p/ global)
+    def nivel_grupo(col):
+        est={}
+        for key,g in d.groupby(col):
+            gg=g[g["lp_c"].abs()>1e-9]
+            if gg["EAN"].nunique()<2 or len(gg)<ELAST_MIN_PONTOS:
+                est[key]=None; continue
+            m=smf.ols("lq_c ~ lp_c",gg).fit(cov_type="cluster",cov_kwds={"groups":gg["EAN"]})
+            e_raw,se=float(m.params["lp_c"]),float(m.bse["lp_c"])
+            tau2=max((e_glob-e_raw)**2-se**2,1e-6)
+            w=tau2/(tau2+se**2) if np.isfinite(se) and se>0 else 0.0
+            e_shr=w*e_raw+(1-w)*e_glob
+            est[key]=float(np.clip(e_shr,lo,hi)) if valido(e_shr) else None
+        return est
+    e_sub=nivel_grupo("SUB")
+    e_cat=nivel_grupo("CATEGORIA")
+
+    # nivel 1: estimativa nos proprios pontos do EAN
+    ref=d.groupby("EAN").agg(SUB=("SUB","first"),CATEGORIA=("CATEGORIA","first"))
+    out={}
+    for ean,g in d.groupby("EAN"):
+        e_ean,_=_ols_simple(g, ELAST_MIN_PONTOS)
+        if valido(e_ean):
+            out[ean]=(float(np.clip(e_ean,lo,hi)),"1-ean"); continue
+        sub=ref.loc[ean,"SUB"]; cat=ref.loc[ean,"CATEGORIA"]
+        if valido(e_sub.get(sub)):
+            out[ean]=(float(e_sub[sub]),"2-sub")
+        elif valido(e_cat.get(cat)):
+            out[ean]=(float(e_cat[cat]),"3-categoria")
+        else:
+            out[ean]=(float(e_glob),"4-global")
+    return out,e_glob
+
+# ------------------------- calibracao t->d (piso teorico, sem espuria) -------------------------
+def calibrar_t_d(incr):
+    """Usa regressao so quando ha variacao independente suficiente; caso contrario
+    piso teorico t/(1+t). Guarda para evitar correlacao espuria com preco_dli."""
+    rel={}
+    for ean,g in incr.groupby("EAN"):
+        t=g["t_hist"].dropna().values; d=g["desc_hist"].dropna().values
+        if len(t)>=3 and len(d)>=3 and np.ptp(t)>1e-3:
+            from scipy.stats import linregress
+            r=linregress(t,d)
+            if r.rvalue**2>0.5 and r.slope>0:
+                a,b=r.intercept,r.slope
+                rel[ean]=(lambda t,a=a,b=b: float(np.clip(a+b*t,0,1)))
+                continue
+        rel[ean]=(lambda t: float(np.clip(t/(1+t) if t>=0 else 0.0,0,1)))
+    return rel
+
+# ------------------------- PATCH 2+3: consolidar com reajuste 7% e dQ shrink -------------------------
+def consolidar(incr, rel, precos_ext=None):
+    precos_ext = precos_ext or {}
+    g=incr.groupby("EAN")
+    cons=g.agg(
+        PRODUTO=("PRODUTO","first"),CATEGORIA=("CATEGORIA","first"),SUB=("SUB","first"),MG5=("MG5","first"),
+        vol_base=("vol_base","mean"),inv_base=("inv_base","mean"),sellout_base=("sellout_base","mean"),
+        dQ=("dQ","mean"),t_mean_hist=("t_hist","mean"),desc_mean_hist=("desc_hist","mean"),
+        inv_unit_mean_hist=("inv_unit_hist","mean"),
+        preco_dli_ref=("preco_dli","mean"),n_safras=("safra_dli","nunique"),
+    ).reset_index()
+
+    # PRECO BASE PROJETADO para a proxima DLI:
+    #  1) se o EAN esta na planilha externa (coluna 'max') -> usa COMO ESTA (ja e final)
+    #  2) senao -> fallback interno: maior preco c/ >=10% share do ultimo ano fiscal * (1+7%)
+    ult = incr.sort_values("ANO_FISCAL").groupby("EAN").tail(1)[["EAN","preco_base"]]
+    ult = ult.rename(columns={"preco_base":"preco_base_ult"})
+    cons = cons.merge(ult,on="EAN",how="left")
+    cons["preco_base_fallback"] = cons["preco_base_ult"]*(1+REAJUSTE_PRECO)
+    cons["preco_ext"] = cons["EAN"].map(precos_ext)   # NaN se ausente
+    cons["preco_base"] = cons["preco_ext"].where(cons["preco_ext"].notna(), cons["preco_base_fallback"])
+    cons["origem_preco_base"] = np.where(cons["preco_ext"].notna(), "planilha_max", "fallback_+7%")
+
+    # Carga tributaria total aproximada por CATEGORIA (ver CARGA_TRIBUTARIA)
+    cons["carga_tributaria"]=cons["CATEGORIA"].map(CARGA_TRIBUTARIA).fillna(CARGA_TRIBUTARIA_DEFAULT)
+
+    cons["t_ref"] = cons["t_mean_hist"].fillna(0.02)
+
+    # PATCH 3: dQ negativo -> shrink para media da SUB (nao zera)
+    sub_dq = cons.groupby("SUB")["dQ"].transform("mean")
+    cons["dQ_raw"]=cons["dQ"]
+    mask_neg = cons["dQ"]<0
+    cons.loc[mask_neg,"dQ"] = 0.5*cons.loc[mask_neg,"dQ"] + 0.5*sub_dq[mask_neg].clip(lower=0)
+    cons["dQ"]=cons["dQ"].clip(lower=0)
+
+    # VARIAVEL DE DECISAO = investimento por UNIDADE (R$/it), COMUM ao MG5.
+    # O K (taxa) de cada item e derivado: K_i = inv_unit / preco_base_i.
+    # Faixa do inv_unit por EAN: ancora historica com flex +/-20% (piso), sem teto
+    # proprio -- o unico teto e a restricao de preco (via K na checagem de viabilidade).
+    cons["invu_ref"]=cons["inv_unit_mean_hist"]
+    cons["invu_min"]=np.maximum(cons["inv_unit_mean_hist"]*(1-FAIXA_T_FLEX),0.0001)
+    cons["invu_max"]=cons["inv_unit_mean_hist"]*(1+FAIXA_T_FLEX)
+    # referencia antiga mantida p/ compatibilidade das funcoes de resposta
+    cons["t_ref"] = cons["t_mean_hist"].fillna(0.02)
+
+    # ultima DLI de cada EAN: preco, sellout, investimento, volume, K e o
+    # PRECO BASE DAQUELE ANO (maior preco c/ >=10% share do ano da DLI, sem +7%)
+    idx=incr.groupby("EAN")["safra_dli"].transform("max")
+    u=incr[incr["safra_dli"]==idx].groupby("EAN").agg(
+        preco_ult_dli=("preco_dli","mean"),
+        preco_base_ano_ult=("preco_base","mean"),
+        sellout_ult_dli=("sellout_dli","mean"),
+        inv_ult_dli=("inv_dli","mean"),
+        vol_ult_dli=("vol_dli","mean"),
+        ano_ult_dli=("safra_dli","max")).reset_index()
+    u["inv_unit_ult_dli"]=np.where(u["vol_ult_dli"]>0, u["inv_ult_dli"]/u["vol_ult_dli"], np.nan)
+    cons=cons.merge(u,on="EAN",how="left")
+    cons["K_ult_dli"]=np.where(cons["preco_base"]>0, cons["inv_unit_ult_dli"]/cons["preco_base"], np.nan)
+
+    # desc_max_DLI = desconto REAL praticado = 1 - preco_DLI / preco_base DAQUELE ANO
+    # (medido contra o preco base do ano da DLI, nao contra o preco base novo).
+    cons["desc_max_dli"]=(1 - cons["preco_ult_dli"]/cons["preco_base_ano_ult"]).clip(lower=0.0, upper=0.9)
+    # DESCONTO AO CONSUMIDOR (para projecao de volume e preco praticado):
+    # candidatos = {desconto max praticado na DLI, carga tributaria}. Preferimos o
+    # MAIOR. Mas o preco praticado = preco_base*(1-desconto) deve ser > preco da
+    # ultima DLI (piso). Se o maior desconto violar o piso, usa-se o menor; se
+    # ambos violarem, o item e inviavel (preco_ok=False) e derruba o MG5.
+    # carga e desc_max seguem tambem como colunas informativas.
+    dmax = cons["desc_max_dli"].fillna(0.0)
+    carga = cons["carga_tributaria"]
+    d_hi = np.maximum(dmax, carga)          # candidato preferido (maior desconto)
+    d_lo = np.minimum(dmax, carga)          # alternativa (menor desconto)
+    pb = cons["preco_base"]; pult = cons["preco_ult_dli"]
+    preco_hi = pb*(1-d_hi); preco_lo = pb*(1-d_lo)
+    # piso: preco praticado > preco da ultima DLI (quando ha preco_ult_dli)
+    if PRECO_NAO_ABAIXO_ULTIMA_DLI:
+        hi_ok = (preco_hi > pult) | pult.isna()
+        lo_ok = (preco_lo > pult) | pult.isna()
+    else:
+        hi_ok = pd.Series(True, index=cons.index); lo_ok = hi_ok
+    # escolhe: maior desconto se respeita o piso; senao o menor se respeita; senao NaN
+    cons["desc_consumidor"]=np.where(hi_ok, d_hi, np.where(lo_ok, d_lo, np.nan))
+    cons["preco_ok"]=hi_ok | lo_ok
+    cons["desc_ref"]=cons["desc_consumidor"].fillna(d_lo)   # ancora do volume
+    cons["preco_dli_novo"]=pb*(1-cons["desc_consumidor"])
+    # f_t_to_d retorna o desconto FIXO do item (independe de t)
+    cons["f_t_to_d"]=cons["desc_ref"].map(lambda dcons: (lambda t, d=float(dcons): d))
+    return cons
+    # desc_ref (ancora do volume) = o proprio desconto do consumidor
+    cons["desc_ref"]=cons["desc_consumidor"]
+    # f_t_to_d agora retorna o desconto FIXO do item (independe de t)
+    cons["f_t_to_d"]=cons["desc_consumidor"].map(lambda dcons: (lambda t, d=float(dcons): d))
+    return cons
+
+# ------------------------- modelo de resposta -------------------------
+# t = K = investimento_por_unidade / preco_base. O investimento e por UNIDADE
+# vendida, entao:  inv_bruto = (t*preco_base) * unidades = t*preco_base*(vol_base+dQ).
+# NAO incide o fator (1-d): o desconto ao consumidor afeta o sell-out e o volume,
+# nao o valor acordado por unidade que financiamos.
+def vol_inc(t,desc_ref,q_ref,e,f):
+    d=np.clip(f(t),0,0.99); denom=1-desc_ref if desc_ref<1 else 0.1
+    return q_ref*((1-d)/denom)**e
+def sellout_tot(t,pb,vb,q_ref,desc_ref,e,f):
+    d=f(t); dQ=vol_inc(t,desc_ref,q_ref,e,f); return pb*(1-d)*(vb+max(dQ,0))
+def inv_bruto_tot(t,pb,vb,q_ref,desc_ref,e,f):
+    dQ=vol_inc(t,desc_ref,q_ref,e,f); return t*pb*(vb+max(dQ,0))
+def dso(t,pb,vb,sb,q_ref,desc_ref,e,f): return sellout_tot(t,pb,vb,q_ref,desc_ref,e,f)-sb
+def dinv(t,pb,vb,ib,q_ref,desc_ref,e,f):
+    return inv_bruto_tot(t,pb,vb,q_ref,desc_ref,e,f)-ib
+
+# ------------------------- alocacao por Lagrange -------------------------
+def metrica_em_t(r,e,t):
+    """dInv, dSellout, d_cons e BRUTOS estimados de um EAN no t dado.
+    t = K = inv_por_unidade/preco_base; inv_bruto = t*preco_base*unidades."""
+    st=sellout_tot(t,r["preco_base"],r["vol_base"],max(r["dQ"],0),r["desc_ref"],e,r["f_t_to_d"])
+    inv_bruto=inv_bruto_tot(t,r["preco_base"],r["vol_base"],max(r["dQ"],0),r["desc_ref"],e,r["f_t_to_d"])
+    di=inv_bruto-r["inv_base"]
+    ds=st-r["sellout_base"]
+    dc=r["f_t_to_d"](t)
+    return di,ds,dc,st,inv_bruto
+
+def t_viavel_ean(r,t):
+    """Com desconto ao consumidor FIXO por premissa (max carga/desc_max_DLI), o t
+    (=K do item, derivado do inv_unit) nao altera o preco. A viabilidade e apenas
+    faixa de inv_unit + ROI, checada na montagem da grade. Sempre True aqui."""
+    return True
+
+def alocar_lagrange(cons,teto,elast,cenario="A",n_grid=161):
+    """DECISAO = investimento por UNIDADE (R$/it), COMUM a todos os itens do MG5.
+    O K de cada item e derivado: K_i = inv_unit / preco_base_i. Cenario controla
+    a regra tudo-ou-nada:
+      A = MG5 so entra se TODOS os itens tem ROI>1 no mesmo inv_unit (estrito).
+      B = MG5 entra inteiro se AO MENOS UM item e viavel; itens fracos entram junto.
+    Objetivo = max sell-out incremental; restricao = investimento bruto <= teto;
+    preco >= ultima DLI por item (limita o inv_unit maximo de cada item)."""
+    cons=cons[~cons["CATEGORIA"].isin(CATEGORIAS_DESCARTADAS)].copy()
+    grupos={}; cortados=[]
+
+    for mg5,gdf in cons.groupby("MG5"):
+        membros=[]
+        for r in gdf.to_dict("records"):
+            ev=elast.get(r["EAN"],(ELASTICIDADE_BASE,"4-global"))
+            r["_elast_origem"]=ev[1]
+            membros.append((r,ev[0]))
+        # grade de inv_unit COMUM ao grupo: cobre a uniao das faixas dos membros
+        invu_lo=min(r["invu_min"] for r,_ in membros)
+        invu_hi=max(r["invu_max"] for r,_ in membros)
+        if not np.isfinite(invu_lo) or not np.isfinite(invu_hi) or invu_hi<=0:
+            grupos[mg5]=None; continue
+        grade_invu=np.linspace(max(invu_lo,1e-4), max(invu_hi,invu_lo+1e-4), n_grid)
+        # matriz [inv_unit x membro]: cada item converte inv_unit -> t_i=invu/preco_base_i
+        info=[]
+        for r,e in membros:
+            prot=r["SUB"] in SUBS_PROTEGIDAS
+            preco_ok=bool(r.get("preco_ok",True))   # preco da prox DLI > ultima DLI
+            linha=[]
+            for invu in grade_invu:
+                t = invu/r["preco_base"] if r["preco_base"]>0 else np.nan
+                # indisponivel se: inv_unit fora da faixa do item, OU preco viola a
+                # restricao (preco proxima DLI nao maior que o da ultima DLI do item)
+                if (not np.isfinite(t) or invu<r["invu_min"]-1e-9 or invu>r["invu_max"]+1e-9
+                        or not preco_ok):
+                    linha.append(None); continue
+                di,ds,dc,st,inv_bruto=metrica_em_t(r,e,t)
+                roi=ds/di if di>0 else -np.inf
+                ok_roi = (di>0 and ds>0 and roi>1.0)
+                pos = (ds>0)
+                linha.append((di,ds,roi,dc,ok_roi,pos,st,inv_bruto,float(t),float(invu)))
+            info.append((r,e,prot,linha))
+        grupos[mg5]=(info,grade_invu)
+
+    def avalia(lam):
+        """Objetivo: max SELL-OUT INCREMENTAL. Restricao: inv. bruto <= teto.
+        K unico por MG5. Diferenca entre cenarios na condicao de candidatura do t:
+          A: t so vale se TODOS os itens tem ROI>1 (cell ok_roi) -> grupo estrito.
+          B: t vale se e viavel (dentro de faixa/preco) p/ TODOS e ao menos um item
+             tem ROI>1; itens fracos entram junto p/ manter o grupo completo.
+        Entre os t candidatos, escolhe o de maior Lagrangeano somado; grupo entra
+        se Lagrangeano total > 0."""
+        gasto_bruto=0.0; escolhas={}
+        for mg5,pack in grupos.items():
+            if pack is None: continue
+            info,grade_invu=pack
+            n_itens=len(info)
+            best=None
+            for j in range(len(grade_invu)):
+                membros=[]; soma_lag=0.0; gasto_t=0.0
+                todos_viaveis=True; algum_roi=False; todos_roi=True
+                for (r,e,prot,linha) in info:
+                    cell=linha[j]
+                    if cell is None:                 # item indisponivel neste inv_unit
+                        todos_viaveis=False; break
+                    di,ds,roi,dc,ok_roi,pos,st,inv_bruto,t_i,invu=cell
+                    algum_roi = algum_roi or ok_roi
+                    todos_roi = todos_roi and ok_roi
+                    soma_lag+=ds-lam*inv_bruto; gasto_t+=inv_bruto
+                    membros.append((r,e,di,ds,roi,dc,prot,st,inv_bruto,t_i,invu))
+                if not todos_viaveis or len(membros)<n_itens:
+                    continue                          # inv_unit nao serve ao grupo inteiro
+                if cenario=="A" and not todos_roi:
+                    continue
+                if cenario=="B" and not algum_roi:
+                    continue
+                if best is None or soma_lag>best[0]:
+                    best=(soma_lag,float(grade_invu[j]),membros,gasto_t)
+            if best is not None and best[0]>0:
+                escolhas[mg5]=(best[1],best[2]); gasto_bruto+=best[3]
+        return gasto_bruto,escolhas
+
+    lo,hi=0.0,500.0
+    for _ in range(90):
+        mid=(lo+hi)/2; g,_=avalia(mid)
+        if g>teto: lo=mid
+        else: hi=mid
+    lam=hi; gbruto,escolhas=avalia(lam)
+
+    ativos=set(); aloc=[]
+    for mg5,(invu_grupo,membros_ok) in escolhas.items():
+        for (r,e,di,ds,roi,dc,pr,st,inv_bruto,t_i,invu) in membros_ok:
+            ativos.add(r["EAN"])
+            k_ult = float(r["K_ult_dli"]) if not pd.isna(r["K_ult_dli"]) else np.nan
+            aloc.append({
+                "EAN":r["EAN"],"PRODUTO":r["PRODUTO"],"CATEGORIA":r["CATEGORIA"],
+                "SUB":r["SUB"],"MG5":mg5,"n_safras":int(r["n_safras"]),
+                "elasticidade":round(float(e),3),
+                "elast_origem":r.get("_elast_origem","4-global"),
+                # --- RECOMENDADO --- (K_i derivado do inv_unit comum ao MG5)
+                "K_RECOMENDADO":round(float(t_i),4),
+                "K_ULTIMA_DLI":round(k_ult,4) if not np.isnan(k_ult) else np.nan,
+                "invest_por_unidade_PROJ":round(float(invu),4),
+                "invest_por_unidade_ULTIMA_DLI":round(float(r["inv_unit_ult_dli"]),4) if not pd.isna(r.get("inv_unit_ult_dli")) else np.nan,
+                "desc_consumidor_PROJ":round(float(dc),4),
+                "carga_tributaria":round(float(r["carga_tributaria"]),4),
+                "desc_max_ult_dli":round(float(r["desc_max_dli"]),4) if not pd.isna(r.get("desc_max_dli")) else np.nan,
+                "preco_base_reaj_PROJ":round(r["preco_base"],2),
+                "origem_preco_base":r.get("origem_preco_base","fallback_+7%"),
+                "preco_praticado_PROX_DLI":round(float(r["preco_dli_novo"]),2) if not pd.isna(r.get("preco_dli_novo")) else np.nan,
+                "preco_ULTIMA_DLI":round(float(r["preco_ult_dli"]),2) if not pd.isna(r["preco_ult_dli"]) else np.nan,
+                "ano_ULTIMA_DLI":int(r["ano_ult_dli"]) if not pd.isna(r["ano_ult_dli"]) else np.nan,
+                # --- INVESTIMENTO: projetado vs realizado ---
+                "investimento_bruto_PROJ":round(float(inv_bruto),2),
+                "investimento_bruto_ULTIMA_DLI":round(float(r["inv_ult_dli"]),2) if not pd.isna(r["inv_ult_dli"]) else np.nan,
+                # --- SELL-OUT: projetado vs realizado ---
+                "sellout_bruto_PROJ":round(float(st),2),
+                "sellout_bruto_ULTIMA_DLI":round(float(r["sellout_ult_dli"]),2) if not pd.isna(r["sellout_ult_dli"]) else np.nan,
+                # --- INCREMENTAIS PROJETADOS (vs baseline reajustado) ---
+                "dInvestimento_PROJ":round(float(di),2),
+                "dSellout_PROJ":round(float(ds),2),
+                "ROI_incremental_PROJ":round(float(roi),3),
+                # flag: item com ROI<=1 mantido apenas p/ nao quebrar o MG5 (so ocorre no cenario B)
+                "item_puxado_pelo_grupo": bool(roi<=1.0),
+            })
+    # cortados: todo EAN elegivel que nao entrou (MG5 inteiro fora)
+    for r in cons.to_dict("records"):
+        if r["EAN"] not in ativos:
+            mot=("MG5 sem K comum com ROI>1 em TODOS os itens" if cenario=="A"
+                 else "MG5 sem K comum viavel (nenhum item atinge ROI>1 respeitando preco)")
+            cortados.append({"EAN":r["EAN"],"PRODUTO":r["PRODUTO"],"MG5":r["MG5"],"motivo":mot})
+    df_a=pd.DataFrame(aloc)
+    if len(df_a):
+        df_a=df_a.sort_values(["MG5","ROI_incremental_PROJ"],ascending=[True,False])
+    verba_incr=df_a["dInvestimento_PROJ"].sum() if len(df_a) else 0.0
+    verba_bruta=df_a["investimento_bruto_PROJ"].sum() if len(df_a) else 0.0
+    return df_a,pd.DataFrame(cortados),verba_incr,verba_bruta,lam
+
+# ------------------------- DLI 2026 (apenas para visualizacao) -------------------------
+def dados_dli_2026(df, ano_calendario=2026):
+    """Dados BRUTOS realizados na DLI do ano CALENDARIO indicado, por EAN. Somente
+    para conferencia do usuario -- nao entra na otimizacao."""
+    d = df[(df["is_dli"]) & (df["ANO"]==ano_calendario)].copy()
+    if len(d)==0:
+        return pd.DataFrame()
+    perf = perfil(df)[["EAN","PRODUTO","CATEGORIA","SUB","MG5"]]
+    agg = d.groupby("EAN").agg(
+        sellout_dli_2026=("sellout","mean"),
+        investimento_dli_2026=("Sum of investimento","mean"),
+        volume_dli_2026=("Sum of Qtd Vendida","mean"),
+        preco_dli_2026=("preco/it","mean"),
+        meses_dli=("MÊS","nunique"),
+    ).reset_index()
+    agg["t_dli_2026"]=np.where(agg["sellout_dli_2026"]>0,
+                               agg["investimento_dli_2026"]/agg["sellout_dli_2026"], np.nan).round(4)
+    out = agg.merge(perf, on="EAN", how="left")
+    cols=["EAN","PRODUTO","CATEGORIA","SUB","MG5","preco_dli_2026","volume_dli_2026",
+          "sellout_dli_2026","investimento_dli_2026","t_dli_2026","meses_dli"]
+    return out[cols].round(2)
+
+# ------------------------- MAIN -------------------------
+COL_ORDER=["EAN","PRODUTO","CATEGORIA","SUB","MG5","n_safras","elasticidade","elast_origem",
+           "K_RECOMENDADO","K_ULTIMA_DLI","invest_por_unidade_PROJ","invest_por_unidade_ULTIMA_DLI",
+           "desc_consumidor_PROJ","carga_tributaria","desc_max_ult_dli",
+           "preco_base_reaj_PROJ","origem_preco_base","preco_praticado_PROX_DLI","preco_ULTIMA_DLI","ano_ULTIMA_DLI",
+           "investimento_bruto_PROJ","investimento_bruto_ULTIMA_DLI",
+           "sellout_bruto_PROJ","sellout_bruto_ULTIMA_DLI",
+           "dInvestimento_PROJ","dSellout_PROJ","ROI_incremental_PROJ","item_puxado_pelo_grupo"]
+
+def resumo_cenario(df_a,df_c,teto,e_glob,nome):
+    if len(df_a):
+        km=np.average(df_a['K_RECOMENDADO'],weights=df_a['dInvestimento_PROJ'])
+        ku=np.average(df_a['K_ULTIMA_DLI'].fillna(0),weights=df_a['investimento_bruto_ULTIMA_DLI'].fillna(0)+1e-9)
+    else: km=ku=0
+    return pd.DataFrame({"Metrica":[
+        "Cenario","Teto BRUTO (restricao)",
+        "Investimento Bruto PROJETADO (prox DLI)","Investimento Bruto REALIZADO (ult DLI)",
+        "Sell-out Bruto PROJETADO (prox DLI)","Sell-out Bruto REALIZADO (ult DLI)",
+        "K medio ponderado RECOMENDADO","K medio ponderado ULTIMA DLI",
+        "EANs Ativados","EANs Cortados","Grupos MG5 ativados",
+        "Itens puxados pelo grupo (ROI<=1)",
+        "Sell-out Incremental PROJETADO","Investimento Incremental PROJETADO",
+        "ROI Incremental PROJETADO","Elasticidade global (within)","Reajuste preco aplicado"],
+        "Valor":[nome,teto,
+            df_a["investimento_bruto_PROJ"].sum() if len(df_a) else 0,
+            df_a["investimento_bruto_ULTIMA_DLI"].sum() if len(df_a) else 0,
+            df_a["sellout_bruto_PROJ"].sum() if len(df_a) else 0,
+            df_a["sellout_bruto_ULTIMA_DLI"].sum() if len(df_a) else 0,
+            round(km,4),round(ku,4),
+            len(df_a),len(df_c),df_a["MG5"].nunique() if len(df_a) else 0,
+            int(df_a["item_puxado_pelo_grupo"].sum()) if len(df_a) else 0,
+            df_a["dSellout_PROJ"].sum() if len(df_a) else 0,
+            df_a["dInvestimento_PROJ"].sum() if len(df_a) else 0,
+            (df_a["dSellout_PROJ"].sum()/df_a["dInvestimento_PROJ"].sum()) if len(df_a) and df_a["dInvestimento_PROJ"].sum()>0 else 0,
+            e_glob, REAJUSTE_PRECO]})
+
+def checa_e_reporta(df_a,df_c,teto,nome):
+    print(f"\n===== CENARIO {nome} =====")
+    print(f"EANs ativados: {len(df_a)} | cortados: {len(df_c)} | grupos MG5: {df_a['MG5'].nunique() if len(df_a) else 0}")
+    if len(df_a):
+        vb=df_a["investimento_bruto_PROJ"].sum()
+        tds=df_a["dSellout_PROJ"].sum(); tdi=df_a["dInvestimento_PROJ"].sum()
+        print(f"Inv. bruto PROJ: R$ {vb:,.2f} ({vb/teto*100:.1f}% do teto)")
+        print(f"Sell-out incr PROJ: R$ {tds:,.2f} | ROI incr total: {tds/tdi:.2f}")
+        iu=df_a.groupby("MG5")["invest_por_unidade_PROJ"].apply(lambda s: round(s.max()-s.min(),4))
+        print(f"[CHECK] MG5 com invest/unidade nao-uniforme: {(iu>1e-3).sum()} (=0)")
+        mg5_at=set(df_a["MG5"].unique()); mg5_ct=set(df_c["MG5"].unique()) if len(df_c) else set()
+        parciais=[m for m in (mg5_at & mg5_ct) if not str(m).startswith("SOLO::")]
+        print(f"[CHECK] MG5 parcialmente ativados: {len(parciais)} (=0)")
+        print(f"[CHECK] itens puxados pelo grupo (ROI<=1): {int(df_a['item_puxado_pelo_grupo'].sum())}")
+        if nome=="A":
+            print(f"[CHECK] ROI incr minimo por EAN: {df_a['ROI_incremental_PROJ'].min():.3f} (>1 no cenario A)")
+
+def main():
+    df=carregar_base(ARQUIVO)
+    print(f"Linhas validas: {len(df)} | EANs: {df['EAN'].nunique()}")
+    incr=incrementalidade(df)
+    teto,bruto,ultima=teto_global(df)
+    TETO_BRUTO=INVESTIMENTO_TOTAL_MAX
+    elast,e_glob=elasticidade_within(df)
+    rel=calibrar_t_d(incr)
+    precos_ext=carregar_precos_externos(_resolver_preco_base())
+    cons=consolidar(incr,rel,precos_ext)
+    n_ext=int((cons["origem_preco_base"]=="planilha_max").sum())
+    print(f"Preco base: {n_ext} EANs via planilha externa, {len(cons)-n_ext} via fallback +7%")
+    df_2026=dados_dli_2026(df, ano_calendario=2026)
+    print(f"Elasticidade global (within): {e_glob:.3f} | Teto BRUTO: R$ {TETO_BRUTO:,.2f}")
+
+    # --- dois cenarios ---
+    dfA_a,dfA_c,_,_,_ = alocar_lagrange(cons,TETO_BRUTO,elast,cenario="A")
+    dfB_a,dfB_c,_,_,_ = alocar_lagrange(cons,TETO_BRUTO,elast,cenario="B")
+    checa_e_reporta(dfA_a,dfA_c,TETO_BRUTO,"A")
+    checa_e_reporta(dfB_a,dfB_c,TETO_BRUTO,"B")
+
+    for d in (dfA_a,dfB_a):
+        if len(d):
+            for c in COL_ORDER:
+                if c not in d.columns: d[c]=np.nan
+    dfA_a=dfA_a[COL_ORDER] if len(dfA_a) else dfA_a
+    dfB_a=dfB_a[COL_ORDER] if len(dfB_a) else dfB_a
+
+    legenda=pd.DataFrame({"Item":[
+        "CENARIO A (estrito)","CENARIO B (grupo junto)",
+        "elasticidade","elast_origem",
+        "K_RECOMENDADO","K_ULTIMA_DLI","invest_por_unidade_PROJ","invest_por_unidade_ULTIMA_DLI",
+        "desc_consumidor_PROJ","carga_tributaria","desc_max_ult_dli","preco_base_reaj_PROJ","origem_preco_base","preco_praticado_PROX_DLI",
+        "preco_ULTIMA_DLI","investimento_bruto_PROJ","investimento_bruto_ULTIMA_DLI",
+        "sellout_bruto_PROJ","sellout_bruto_ULTIMA_DLI","dInvestimento_PROJ",
+        "dSellout_PROJ","ROI_incremental_PROJ","item_puxado_pelo_grupo"],
+        "Significado":[
+        "MG5 so entra na DLI se TODOS os seus itens tem ROI incremental > 1 no K comum. Senao, grupo inteiro cortado.",
+        "MG5 entra inteiro se AO MENOS UM item e viavel; itens fracos (ROI<=1) entram junto para nao quebrar o grupo.",
+        "Elasticidade-preco usada na projecao de volume (negativa; quanto maior o modulo, mais sensivel a preco)",
+        "ORIGEM da elasticidade: 1-ean (estimada no proprio EAN) | 2-sub | 3-categoria | 4-global (fallback). Quanto maior o numero, menos especifica/confiavel.",
+        "RECOMENDADO: taxa K = investimento por unidade / preco base. Derivada do valor acordado por unidade; cai se o preco sobe.",
+        "REALIZADO: K praticado na ultima DLI (investimento por unidade / preco base).",
+        "RECOMENDADO: investimento por UNIDADE vendida (R$/it) sugerido - este e o valor de fato acordado com o varejo.",
+        "REALIZADO: investimento por unidade praticado na ultima DLI (R$/it).",
+        "PROJETADO: desconto ao consumidor = max(carga tributaria, desconto max da DLI). Fixo por item.",
+        "Carga tributaria total aproximada da CATEGORIA (ICMS+PIS/COFINS+IPI). ESTIMATIVA - validar com fiscal.",
+        "Desconto maximo praticado na ultima DLI = 1 - preco_DLI / novo_preco_base.",
+        "PROJETADO: preco base da proxima DLI. Vem da planilha externa (coluna max) se o EAN existir la; senao fallback interno.",
+        "Origem do preco base: 'planilha_max' (carregado externamente, usado como esta) ou 'fallback_+7%' (maior preco c/ >=10% share do ultimo ano fiscal x1.07)",
+        "PROJETADO: preco praticado por item na proxima DLI = preco_base*(1-desconto). Restricao: > preco da ultima DLI.",
+        "REALIZADO: preco praticado na ultima DLI (piso: preco nao cai abaixo dele)",
+        "PROJETADO: investimento bruto estimado na proxima DLI (K x sellout projetado)",
+        "REALIZADO: investimento bruto na ultima DLI",
+        "PROJETADO: sellout bruto estimado na proxima DLI",
+        "REALIZADO: sellout bruto na ultima DLI",
+        "PROJETADO: investimento incremental vs baseline reajustado",
+        "PROJETADO: sellout incremental vs baseline reajustado (OBJETIVO maximizado)",
+        "PROJETADO: dSellout/dInvestimento",
+        "TRUE = item com ROI<=1 mantido apenas para nao quebrar o MG5 (so aparece no cenario B)"]})
+
+    comparativo=pd.concat([
+        resumo_cenario(dfA_a,dfA_c,TETO_BRUTO,e_glob,"A - estrito (tudo-ou-nada c/ ROI>1)"),
+        resumo_cenario(dfB_a,dfB_c,TETO_BRUTO,e_glob,"B - grupo junto (mantem itens fracos)").rename(columns={"Valor":"Valor_B"})
+    ],axis=1)
+    comparativo=comparativo.loc[:,~comparativo.columns.duplicated()]
+    comparativo.columns=["Metrica","Cenario_A","Cenario_B"] if comparativo.shape[1]==3 else comparativo.columns
+
+    with pd.ExcelWriter(SAIDA) as w:
+        comparativo.to_excel(w,sheet_name="Comparativo A vs B",index=False)
+        dfA_a.to_excel(w,sheet_name="Cenario A - Recomendado",index=False)
+        dfA_c.to_excel(w,sheet_name="Cenario A - Cortados",index=False)
+        dfB_a.to_excel(w,sheet_name="Cenario B - Recomendado",index=False)
+        dfB_c.to_excel(w,sheet_name="Cenario B - Cortados",index=False)
+        legenda.to_excel(w,sheet_name="Legenda",index=False)
+        if len(df_2026):
+            df_2026.to_excel(w,sheet_name="DLI_2026 (realizado)",index=False)
+        cons[["EAN","PRODUTO","SUB","preco_base_ult","preco_base","desc_ref","t_ref","dQ_raw","dQ","n_safras"]].to_excel(w,sheet_name="Diagnostico",index=False)
+    print(f"\nArquivo salvo: {SAIDA}  (abas: Comparativo A vs B | Cenario A/B - Recomendado/Cortados | Legenda | DLI_2026 | Diagnostico)")
+    try:
+        import shutil
+        os.makedirs("/mnt/user-data/outputs", exist_ok=True)
+        shutil.copy(SAIDA, "/mnt/user-data/outputs/dli_resultado_consenso.xlsx")
+    except Exception:
+        pass
+
+if __name__=="__main__":
+    main()
