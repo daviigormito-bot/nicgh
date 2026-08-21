@@ -1,0 +1,348 @@
+import os, sys, glob, numpy as np, pandas as pd
+import statsmodels.formula.api as smf
+
+CAMINHO_BASE = ""           # Caminho do histórico (ou passe via CLI/prompt)
+CAMINHO_PRECO_MAX = ""      # Caminho da tabela de preços máximos (colunas: EAN, max)
+SEP = "\t"
+
+def _resolver_arquivo(caminho_fixo, desc="base principal"):
+    if caminho_fixo.strip(): return caminho_fixo.strip().strip('"')
+    if len(sys.argv) > 1 and sys.argv[1].strip() and desc == "base principal":
+        return sys.argv[1].strip().strip('"')
+    cand = [f for f in glob.glob("*.xlsx")+glob.glob("*.txt") if not f.startswith("dli_")]
+    if len(cand) == 1 and desc == "base principal": return os.path.abspath(cand[0])
+    return input(f"Cole o caminho da {desc} (.xlsx/.txt/.csv) e tecle Enter: ").strip().strip('"')
+
+ARQUIVO = _resolver_arquivo(CAMINHO_BASE, "base principal (histórico)")
+SAIDA = "dli_resultado_consenso.xlsx"
+
+INVESTIMENTO_TOTAL_MAX = 750_000.0
+PISO_ORCAMENTO = 0.70
+MESES_FORA_BASELINE = {11}
+FAIXA_T_FLEX = 0.20
+T_MAX_GLOBAL = 0.50             # Desconto máximo comercial permitido (ex: 50%)
+T_MIN_COMPETITIVO = 0.02
+ELASTICIDADE_BASE = -1.2
+ELAST_FAIXA = (-4.0, -0.3)
+ELAST_MIN_PONTOS = 8
+PRECO_NAO_ABAIXO_ULTIMA_DLI = True
+SUBS_PROTEGIDAS = set()
+CATEGORIAS_DESCARTADAS = set()
+REAJUSTE_PRECO = 0.07           # Fallback quando EAN não constar na tabela de max
+
+COLS_NUMERICAS = ["Sum of investimento", "Sum of Qtd Vendida", "sellout", "su", "PREÇO/su", "preco/it"]
+
+def limpar_numero(v):
+    if pd.isna(v): return np.nan
+    s = str(v).strip()
+    if s in ("", "#N/A", "nan", "NaN", "(blank)", "-"): return np.nan
+    s = s.replace(".", "").replace(",", ".") if s.count(",")==1 and s.count(".")>=1 else s.replace(",", ".")
+    try: return float(s)
+    except ValueError: return np.nan
+
+def carregar_base(caminho):
+    ext = os.path.splitext(caminho)[1].lower()
+    if ext in (".xlsx", ".xls", ".xlsm"):
+        df = pd.read_excel(caminho, dtype=str)
+    else:
+        df = pd.read_csv(caminho, sep=SEP, dtype=str, engine="python")
+    df.columns = [c.strip() for c in df.columns]
+    df = df[~df["chave"].astype(str).str.contains("Grand Total", na=False)]
+    df = df[df["chave"].notna() & (df["chave"].astype(str).str.strip()!="")]
+    df = df[df["chave"].astype(str).str.strip()!="(blank)"]
+    df["EAN"] = df["chave"].astype(str).str.replace(r"\D","",regex=True).str[:13]
+    df = df[df["EAN"].str.len()==13]
+    for c in COLS_NUMERICAS:
+        if c in df.columns: df[c] = df[c].apply(limpar_numero)
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce")
+    df["MÊS"] = pd.to_numeric(df["MÊS"], errors="coerce")
+    df = df.dropna(subset=["ANO","MÊS"])
+    df["ANO_FISCAL"] = df["ANO"].astype(int) - (df["MÊS"] < 7).astype(int)
+    df["is_dli"] = df["dli"].astype(str).str.strip().str.lower()=="y"
+    df["is_baseline"] = (~df["is_dli"]) & (~df["MÊS"].isin(MESES_FORA_BASELINE))
+    df["safra_dli"] = np.where(df["is_dli"], df["ANO_FISCAL"], np.nan)
+    return df
+
+def carregar_tabela_max(caminho):
+    if not caminho or not os.path.exists(caminho):
+        return pd.DataFrame(columns=["EAN", "max_preco_tabela"])
+    ext = os.path.splitext(caminho)[1].lower()
+    df = pd.read_excel(caminho, dtype=str) if ext in (".xlsx", ".xls", ".xlsm") else pd.read_csv(caminho, sep=None, dtype=str, engine="python")
+    df.columns = [c.strip().lower() for c in df.columns]
+    ean_col = next((c for c in df.columns if "ean" in c), "ean")
+    max_col = next((c for c in df.columns if "max" in c), "max")
+    df["EAN"] = df[ean_col].astype(str).str.replace(r"\D","",regex=True).str[:13]
+    df["max_preco_tabela"] = df[max_col].apply(limpar_numero)
+    return df.dropna(subset=["EAN", "max_preco_tabela"])[["EAN", "max_preco_tabela"]].drop_duplicates("EAN")
+
+# ------------------------- Baseline com corte de 10% Sell-out -------------------------
+def baseline_af(df):
+    base = df[df["is_baseline"]].copy()
+    so_total = base.groupby(["EAN", "ANO_FISCAL"])["sellout"].transform("sum")
+    base["pct_so"] = np.where(so_total > 0, base["sellout"] / so_total, 0.0)
+    
+    # Filtro: considerar meses representativos (> 10% do sellout anual)
+    base_rep = base[base["pct_so"] >= 0.10].copy()
+    if len(base_rep) == 0:
+        base_rep = base.copy()
+        
+    p_max = base_rep.groupby(["EAN","ANO_FISCAL"])["preco/it"].max().reset_index().rename(columns={"preco/it":"preco_base"})
+    
+    agg_base = base.groupby(["EAN","ANO_FISCAL"]).agg(
+        sellout_base=("sellout","mean"),
+        inv_base=("Sum of investimento","mean"),
+        vol_base=("Sum of Qtd Vendida","mean")
+    ).reset_index()
+    
+    return agg_base.merge(p_max, on=["EAN","ANO_FISCAL"], how="left")
+
+def perfil(df):
+    def pv(s):
+        s = s[s.astype(str).str.strip().replace({"#N/A":np.nan,"(blank)":np.nan}).notna()]
+        return s.iloc[0] if len(s) else np.nan
+    p = df.groupby("EAN").agg(PRODUTO=("PRODUTO",pv),CATEGORIA=("CATEGORIA",pv),
+                              SUB=("SUB",pv),mg5=("mg5",pv)).reset_index()
+    p["MG5"] = p["mg5"].fillna("").astype(str).str.strip()
+    p["MG5"] = np.where(p["MG5"].isin(["","#N/A","(blank)","nan"]), "SOLO::"+p["EAN"], p["MG5"])
+    return p.drop(columns=["mg5"])
+
+def dli_safra(df):
+    dli = df[df["is_dli"]].copy()
+    return dli.groupby(["EAN","safra_dli"]).agg(
+        sellout_dli=("sellout","mean"), inv_dli=("Sum of investimento","mean"),
+        vol_dli=("Sum of Qtd Vendida","mean"), preco_dli=("preco/it","mean"),
+    ).reset_index()
+
+def incrementalidade(df):
+    base, dli, perf = baseline_af(df), dli_safra(df), perfil(df)
+    m = dli.merge(base, left_on=["EAN","safra_dli"], right_on=["EAN","ANO_FISCAL"], how="left")
+    m = m.merge(perf, on="EAN", how="left")
+    m["dQ"] = m["vol_dli"] - m["vol_base"]
+    m["dSellout"] = m["sellout_dli"] - m["sellout_base"]
+    m["dInv"] = m["inv_dli"] - m["inv_base"]
+    m["desc_hist"] = np.where(m["preco_base"]>0, 1.0 - m["preco_dli"]/m["preco_base"], np.nan).clip(lower=0.0)
+    m["k_hist"] = np.where(m["sellout_dli"]>0, m["inv_dli"]/m["sellout_dli"], np.nan).clip(0.0,1.0)
+    return m.dropna(subset=["preco_base","vol_base","sellout_base","inv_base"])
+
+def elasticidade_within(df):
+    d = df.dropna(subset=["preco/it","Sum of Qtd Vendida","EAN","SUB"]).copy()
+    d = d[(d["preco/it"]>0)&(d["Sum of Qtd Vendida"]>0)]
+    d["lp"]=np.log(d["preco/it"]); d["lq"]=np.log(d["Sum of Qtd Vendida"])
+    d["lp_c"]=d["lp"]-d.groupby("EAN")["lp"].transform("mean")
+    d["lq_c"]=d["lq"]-d.groupby("EAN")["lq"].transform("mean")
+    lo,hi=ELAST_FAIXA
+    dd = d[d["lp_c"].abs()>1e-9]
+    if len(dd)>ELAST_MIN_PONTOS and dd["EAN"].nunique()>1:
+        gm=smf.ols("lq_c ~ lp_c",dd).fit(cov_type="cluster",cov_kwds={"groups":dd["EAN"]})
+        e_glob=float(np.clip(gm.params["lp_c"],lo,hi))
+    else:
+        e_glob=ELASTICIDADE_BASE
+    out={}
+    for sub,g in d.groupby("SUB"):
+        gg=g[g["lp_c"].abs()>1e-9]
+        if gg["EAN"].nunique()<3 or len(gg)<ELAST_MIN_PONTOS:
+            e_sub,se=e_glob,np.inf
+        else:
+            m=smf.ols("lq_c ~ lp_c",gg).fit(cov_type="cluster",cov_kwds={"groups":gg["EAN"]})
+            e_sub,se=float(m.params["lp_c"]),float(m.bse["lp_c"])
+        tau2=max((e_glob-e_sub)**2-se**2,1e-6)
+        w=tau2/(tau2+se**2) if np.isfinite(se) else 0.0
+        e_shr=float(np.clip(w*e_sub+(1-w)*e_glob,lo,hi))
+        origem=f"SUB-Shrinkage ({sub} | w={w:.2f})" if np.isfinite(se) else "Global Carteira"
+        for ean in g["EAN"].unique():
+            out[ean]=(e_shr,origem)
+    return out,e_glob
+
+def consolidar(incr, df_max):
+    g=incr.groupby("EAN")
+    cons=g.agg(
+        PRODUTO=("PRODUTO","first"),CATEGORIA=("CATEGORIA","first"),SUB=("SUB","first"),MG5=("MG5","first"),
+        vol_base=("vol_base","mean"),inv_base=("inv_base","mean"),sellout_base=("sellout_base","mean"),
+        dQ=("dQ","mean"),k_mean_hist=("k_hist","mean"),desc_mean_hist=("desc_hist","mean"),
+        preco_dli_ref=("preco_dli","mean"),n_safras=("safra_dli","nunique"),
+    ).reset_index()
+
+    # Preço base último ano fiscal
+    ult = incr.sort_values("ANO_FISCAL").groupby("EAN").tail(1)[["EAN","preco_base"]]
+    cons = cons.merge(ult.rename(columns={"preco_base":"preco_base_ult"}), on="EAN", how="left")
+    
+    # Preço Base Projetado: Prioridade Arquivo Externo, Fallback +7%
+    cons = cons.merge(df_max, on="EAN", how="left")
+    cons["preco_base"] = np.where(cons["max_preco_tabela"].notna() & (cons["max_preco_tabela"] > 0),
+                                  cons["max_preco_tabela"],
+                                  cons["preco_base_ult"] * (1 + REAJUSTE_PRECO))
+
+    cons["desc_ref"] = (1 - cons["preco_dli_ref"]/cons["preco_base"]).clip(0.0,0.49).fillna(0.05)
+
+    # Shrinkage dQ negativo
+    sub_dq = cons.groupby("SUB")["dQ"].transform("mean")
+    mask_neg = cons["dQ"]<0
+    cons.loc[mask_neg,"dQ"] = 0.5*cons.loc[mask_neg,"dQ"] + 0.5*sub_dq[mask_neg].clip(lower=0)
+    cons["dQ"]=cons["dQ"].clip(lower=0)
+
+    # Faixas de K (Desconto)
+    cons["k_min"] = np.maximum(cons["k_mean_hist"]*(1-FAIXA_T_FLEX), 0.001).fillna(0.001)
+    cons["k_max"] = T_MAX_GLOBAL
+
+    # Dados da última DLI realizada
+    idx=incr.groupby("EAN")["safra_dli"].transform("max")
+    u=incr[incr["safra_dli"]==idx].groupby("EAN").agg(
+        preco_ult_dli=("preco_dli","mean"),
+        sellout_ult_dli=("sellout_dli","mean"),
+        inv_ult_dli=("inv_dli","mean"),
+        desc_ult_dli=("desc_hist","mean"),
+        k_ult_dli=("k_hist","mean"),
+        ano_ult_dli=("safra_dli","max")).reset_index()
+    
+    return cons.merge(u, on="EAN", how="left")
+
+# ------------------------- Funções de Resposta -------------------------
+def vol_inc(k, desc_ref, q_ref, e):
+    denom = 1 - desc_ref if desc_ref < 1 else 0.1
+    return q_ref * np.maximum(((1 - k) / denom), 0.01) ** e
+
+def sellout_tot(k, pb, vb, q_ref, desc_ref, e):
+    dQ = vol_inc(k, desc_ref, q_ref, e)
+    return pb * (1 - k) * (vb + max(dQ, 0))
+
+def metrica_em_k(r, e, k):
+    st = sellout_tot(k, r["preco_base"], r["vol_base"], max(r["dQ"], 0), r["desc_ref"], e)
+    inv_bruto = k * st
+    di = inv_bruto - r["inv_base"]
+    ds = st - r["sellout_base"]
+    preco_praticado = r["preco_base"] * (1 - k)
+    return di, ds, preco_praticado, st, inv_bruto
+
+def k_viavel_ean(r, k):
+    if k < r["k_min"] - 1e-9 or k > r["k_max"] + 1e-9: return False
+    if PRECO_NAO_ABAIXO_ULTIMA_DLI and not pd.isna(r["preco_ult_dli"]) and r["preco_base"] > 0:
+        p_prat = r["preco_base"] * (1 - k)
+        if p_prat < (r["preco_ult_dli"] - 1e-4): return False
+    return True
+
+def alocar_lagrange(cons, teto, elast, n_grid=161):
+    cons = cons[~cons["CATEGORIA"].isin(CATEGORIAS_DESCARTADAS)].copy()
+    grid = np.linspace(0.001, T_MAX_GLOBAL, n_grid)
+    grupos = {}
+
+    for mg5, gdf in cons.groupby("MG5"):
+        membros = []
+        for r in gdf.to_dict("records"):
+            e_info = elast.get(r["EAN"], (ELASTICIDADE_BASE, "Global Padrão"))
+            membros.append((r, e_info[0], e_info[1]))
+            
+        info = []
+        for r, e, orig in membros:
+            prot = r["SUB"] in SUBS_PROTEGIDAS
+            linha = []
+            for k in grid:
+                if not k_viavel_ean(r, k):
+                    linha.append(None); continue
+                di, ds, preco_est, st, inv_bruto = metrica_em_k(r, e, k)
+                roi = ds / di if di > 0 else -np.inf
+                ok = (di > 0 and ds > 0 and roi > 1.0)
+                linha.append((di, ds, roi, preco_est, ok, prot, st, inv_bruto))
+            info.append((r, e, orig, prot, linha))
+        grupos[mg5] = info
+
+    def avalia(lam):
+        gasto_bruto = 0.0; escolhas = {}
+        for mg5, info in grupos.items():
+            best = None
+            for j, k in enumerate(grid):
+                soma_lag = 0.0; membros_ok = []; gasto_k = 0.0
+                for (r, e, orig, prot, linha) in info:
+                    cell = linha[j]
+                    if cell is None: continue
+                    di, ds, roi, preco_est, ok, pr, st, inv_bruto = cell
+                    if not ok: continue
+                    lag = ds - lam * inv_bruto
+                    if lag > 0:
+                        soma_lag += lag; gasto_k += inv_bruto
+                        membros_ok.append((r, e, orig, di, ds, roi, preco_est, pr, st, inv_bruto))
+                if not membros_ok: continue
+                if best is None or soma_lag > best[0]:
+                    best = (soma_lag, k, membros_ok, gasto_k)
+            if best is not None:
+                escolhas[mg5] = (best[1], best[2]); gasto_bruto += best[3]
+        return gasto_bruto, escolhas
+
+    lo, hi = 0.0, 500.0
+    for _ in range(90):
+        mid = (lo + hi) / 2
+        g, _ = avalia(mid)
+        if g > teto: lo = mid
+        else: hi = mid
+    lam = hi; gbruto, escolhas = avalia(lam)
+
+    ativos = set(); aloc = []; cortados = []
+    for mg5, (k_rec, membros_ok) in escolhas.items():
+        for (r, e, orig, di, ds, roi, preco_est, pr, st, inv_bruto) in membros_ok:
+            ativos.add(r["EAN"])
+            aloc.append({
+                "EAN": r["EAN"],
+                "PRODUTO": r["PRODUTO"],
+                "CATEGORIA": r["CATEGORIA"],
+                "SUB": r["SUB"],
+                "MG5": mg5,
+                "n_safras": int(r["n_safras"]),
+                "elasticidade": round(float(e), 3),
+                "origem_elasticidade": orig,
+                
+                # --- RECOMENDAÇÕES & PREÇOS ---
+                "K_RECOMENDADO (Desconto %)": round(float(k_rec), 4),
+                "preco_base_PROJ (Máximo)": round(r["preco_base"], 2),
+                "preco_praticado_PROJ": round(float(preco_est), 2),
+                
+                # --- HISTÓRICO ÚLTIMA DLI ---
+                "K_ULTIMA_DLI": round(float(r["k_ult_dli"]), 4) if not pd.isna(r["k_ult_dli"]) else np.nan,
+                "desconto_ULTIMA_DLI": round(float(r["desc_ult_dli"]), 4) if not pd.isna(r["desc_ult_dli"]) else np.nan,
+                "preco_ULTIMA_DLI": round(float(r["preco_ult_dli"]), 2) if not pd.isna(r["preco_ult_dli"]) else np.nan,
+                "ano_ULTIMA_DLI": int(r["ano_ult_dli"]) if not pd.isna(r["ano_ult_dli"]) else np.nan,
+                
+                # --- FINANCEIRO PROJETADO ---
+                "investimento_bruto_PROJ": round(float(inv_bruto), 2),
+                "sellout_bruto_PROJ": round(float(st), 2),
+                "dInvestimento_PROJ": round(float(di), 2),
+                "dSellout_PROJ": round(float(ds), 2),
+                "ROI_incremental_PROJ": round(float(roi), 3),
+            })
+            
+    for r in cons.to_dict("records"):
+        if r["EAN"] not in ativos:
+            cortados.append({"EAN": r["EAN"], "PRODUTO": r["PRODUTO"], "MG5": r["MG5"], "motivo": "ROI<=1 ou restrição de preço"})
+
+    df_a = pd.DataFrame(aloc)
+    if len(df_a): df_a = df_a.sort_values(["MG5", "ROI_incremental_PROJ"], ascending=[True, False])
+    return df_a, pd.DataFrame(cortados), lam
+
+# ------------------------- MAIN -------------------------
+def main():
+    df = carregar_base(ARQUIVO)
+    
+    # Busca por arquivo de preços máximos
+    caminho_max = CAMINHO_PRECO_MAX
+    if not caminho_max:
+        cand_max = [f for f in glob.glob("*max*.xlsx") + glob.glob("*max*.txt") + glob.glob("*preco*.xlsx")]
+        if cand_max: caminho_max = cand_max[0]
+        else: caminho_max = input("Cole o caminho da base de Preço MAX (Enter para ignorar e usar +7%): ").strip().strip('"')
+    
+    df_max = carregar_tabela_max(caminho_max)
+    print(f"Preços máximos carregados para {len(df_max)} EANs.")
+    
+    incr = incrementalidade(df)
+    elast_map, _ = elasticidade_within(df)
+    cons = consolidar(incr, df_max)
+    
+    rec, cort, lam = alocar_lagrange(cons, INVESTIMENTO_TOTAL_MAX, elast_map)
+    
+    with pd.ExcelWriter(SAIDA, engine="openpyxl") as writer:
+        rec.to_excel(writer, sheet_name="Recomendado (K)", index=False)
+        cort.to_excel(writer, sheet_name="Cortados", index=False)
+        
+    print(f"\nOtimização concluída com sucesso! Resultados salvos em: {SAIDA}")
+    print(f"Total Investimento Bruto: R$ {rec['investimento_bruto_PROJ'].sum():,.2f}")
+    print(f"Total Sell-out Incremental: R$ {rec['dSellout_PROJ'].sum():,.2f}")
+
+if __name__ == "__main__":
+    main()
