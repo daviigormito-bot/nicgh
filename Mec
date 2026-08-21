@@ -1,0 +1,24 @@
+def incrementalidade(df):
+    base, dli, perf = baseline_af(df), dli_safra(df), perfil(df)
+    m = dli.merge(base, left_on=["EAN","safra_dli"], right_on=["EAN","ANO_FISCAL"], how="left")
+    m = m.merge(perf, on="EAN", how="left")
+    
+    # 1. Força a conversão de todas as colunas numéricas para float antes das contas
+    cols_calc = ["vol_dli", "vol_base", "sellout_dli", "sellout_base", "inv_dli", "inv_base", "preco_dli", "preco_base"]
+    for col in cols_calc:
+        if col in m.columns:
+            m[col] = pd.to_numeric(m[col], errors="coerce")
+            
+    m["dQ"] = m["vol_dli"] - m["vol_base"]
+    m["dSellout"] = m["sellout_dli"] - m["sellout_base"]
+    m["dInv"] = m["inv_dli"] - m["inv_base"]
+    
+    # 2. Desacopla o cálculo e aplica o clip via Pandas Series para evitar o erro do NumPy ufunc
+    m["desc_hist"] = np.where(m["preco_base"] > 0, 1.0 - (m["preco_dli"] / m["preco_base"]), np.nan)
+    m["desc_hist"] = pd.to_numeric(m["desc_hist"], errors="coerce").clip(lower=0.0)
+    
+    # 3. Alinha a nomenclatura de t_hist para k_hist
+    m["k_hist"] = np.where(m["sellout_dli"] > 0, m["inv_dli"] / m["sellout_dli"], np.nan)
+    m["k_hist"] = pd.to_numeric(m["k_hist"], errors="coerce").clip(lower=0.0, upper=1.0)
+    
+    return m.dropna(subset=["preco_base","vol_base","sellout_base","inv_base"])
