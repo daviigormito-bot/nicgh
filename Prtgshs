@@ -1,0 +1,4 @@
+=INDEX(FILTER($L$2:$L$1000, (--$B$2:$B$1000=--B2) * (NOT(ISNA($L$2:$L$1000)))), 1)
+=INDEX(FILTER($M$2:$M$1000, (--$B$2:$B$1000=--B2) * (NOT(ISNA($M$2:$M$1000)))), 1)
+=INDEX(FILTER($N$2:$N$1000, (--$B$2:$B$1000=--B2) * (NOT(ISNA($N$2:$N$1000)))), 1)
+=INDEX(FILTER($O$2:$O$1000, (--$B$2:$B$1000=--B2) * (NOT(ISNA($O$2:$O$1000)))), 1)
