@@ -1,0 +1,129 @@
+"""
+Corrige a base em duas frentes, sem alterar 'preco/it' (ja vem dado):
+
+1) ATRIBUTOS CATEGORIA, SUB, mg5, PRODUTO: quando vazios/#N/A em algumas linhas
+   de um EAN mas preenchidos em outras, copia o valor valido do proprio EAN.
+
+2) su e PRECO/su faltantes:
+   - su   = Qtd (item) * taxa de conversao item->su do proprio EAN
+            (taxa = mediana de su/Qtd das linhas validas do EAN)
+   - PRECO/su = sellout / su  (depois de recuperar o su)
+
+Preserva as mesmas colunas e a ordem das linhas.
+
+COMO USAR:
+  1) Preencha CAMINHO_ENTRADA abaixo com o caminho do seu .xlsx, OU
+     rode:  python corrigir_atributos.py "C:\\caminho\\base.xlsx"
+  2) O resultado sai como .xlsx na mesma pasta, com sufixo _corrigido.
+"""
+import os
+import sys
+import glob
+import pandas as pd
+import numpy as np
+
+# >>> COLE O CAMINHO DO SEU ARQUIVO .xlsx AQUI (ou deixe "" e passe na linha de comando) <<<
+CAMINHO_ENTRADA = ""
+
+
+def _resolver_entrada():
+    if CAMINHO_ENTRADA.strip():
+        return CAMINHO_ENTRADA.strip().strip('"')
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        return sys.argv[1].strip().strip('"')
+    cand = [f for f in glob.glob("*.xlsx") if "corrigido" not in f.lower()]
+    if len(cand) == 1:
+        return os.path.abspath(cand[0])
+    return input("Cole o caminho do arquivo .xlsx e tecle Enter: ").strip().strip('"')
+
+
+ENTRADA = _resolver_entrada()
+if not ENTRADA:
+    print("Erro: nenhum arquivo informado.")
+    sys.exit(1)
+
+base, ext = os.path.splitext(ENTRADA)
+SAIDA = base + "_corrigido.xlsx"
+
+# le tudo como texto, sem converter nada
+df = pd.read_excel(ENTRADA, dtype=str)
+orig_cols = list(df.columns)
+df.columns = [c.strip() for c in df.columns]
+
+# EAN a partir da chave (so para agrupar; NAO vira coluna de saida)
+ean = df["chave"].astype(str).str.replace(r"\D", "", regex=True).str[:13]
+
+INVALIDOS = {"#N/A", "(blank)", "nan", "NaN", "", "#N/D", "NULL"}
+def eh_invalido(serie):
+    s = serie.astype(str).str.strip()
+    return s.isin(INVALIDOS) | serie.isna()
+
+def num_br(serie):
+    """Converte texto em formato BR (virgula decimal) para float."""
+    s = serie.astype(str).str.strip()
+    s = s.where(~s.isin(INVALIDOS), np.nan)
+    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+def para_texto_br(serie_num):
+    """Formata float de volta para texto com virgula decimal (so onde nao e NaN)."""
+    return serie_num.map(lambda v: ("%.6f" % v).replace(".", ",") if pd.notna(v) else np.nan)
+
+# ---------------------------------------------------------------------------
+# 1) ATRIBUTOS: CATEGORIA, SUB, mg5, PRODUTO
+# ---------------------------------------------------------------------------
+COLS_ATR = ["CATEGORIA", "SUB", "mg5", "PRODUTO"]
+relatorio = {}
+for col in COLS_ATR:
+    if col not in df.columns:
+        continue
+    inval = eh_invalido(df[col])
+    n_antes = int(inval.sum())
+    tmp = df[col].where(~inval, np.nan)
+    preench = tmp.groupby(ean).transform(lambda x: x.dropna().iloc[0] if x.notna().any() else np.nan)
+    df[col] = df[col].where(~inval, preench)
+    n_depois = int(eh_invalido(df[col]).sum())
+    relatorio[col] = (n_antes, n_antes - n_depois, n_depois)
+
+# ---------------------------------------------------------------------------
+# 2) su (via taxa de conversao item->su) e PRECO/su (sellout/su)
+# ---------------------------------------------------------------------------
+qtd  = num_br(df["Sum of Qtd Vendida"]) if "Sum of Qtd Vendida" in df.columns else pd.Series(np.nan, index=df.index)
+su   = num_br(df["su"]) if "su" in df.columns else pd.Series(np.nan, index=df.index)
+sell = num_br(df["sellout"]) if "sellout" in df.columns else pd.Series(np.nan, index=df.index)
+
+# taxa de conversao item->su por EAN (mediana de su/Qtd das linhas validas do EAN)
+fator_lin = np.where(qtd > 0, su / qtd, np.nan)
+fator_ean = pd.Series(fator_lin, index=df.index).groupby(ean).transform("median")
+
+# su faltante -> Qtd * taxa do EAN
+su_falt = su.isna() & qtd.notna() & fator_ean.notna()
+su_rec = su.copy()
+su_rec[su_falt] = qtd[su_falt] * fator_ean[su_falt]
+n_su = int(su_falt.sum())
+
+# PRECO/su faltante -> sellout / su
+psu = num_br(df["PREÇO/su"]) if "PREÇO/su" in df.columns else pd.Series(np.nan, index=df.index)
+psu_falt = psu.isna() & sell.notna() & (su_rec > 0)
+psu_rec = psu.copy()
+psu_rec[psu_falt] = sell[psu_falt] / su_rec[psu_falt]
+n_psu = int(psu_falt.sum())
+
+# grava de volta so as celulas recuperadas, mantendo o texto original nas demais
+if "su" in df.columns:
+    df.loc[su_falt, "su"] = para_texto_br(su_rec[su_falt])
+if "PREÇO/su" in df.columns:
+    df.loc[psu_falt, "PREÇO/su"] = para_texto_br(psu_rec[psu_falt])
+
+# restaura os nomes originais das colunas e salva como xlsx
+df.columns = orig_cols
+df.to_excel(SAIDA, index=False)
+
+print("1) Atributos (CATEGORIA/SUB/mg5/PRODUTO) por EAN:")
+for col, (antes, corrigidos, restantes) in relatorio.items():
+    print(f"   {col:12}: {antes} vazios -> {corrigidos} preenchidos, {restantes} sem valor no EAN")
+print("2) Numericos:")
+print(f"   su       : {n_su} recuperados (Qtd * taxa de conversao do EAN)")
+print(f"   PRECO/su : {n_psu} recuperados (sellout / su)")
+print(f"\nBase corrigida salva em: {SAIDA}")
+print("A coluna 'preco/it' NAO foi alterada.")
