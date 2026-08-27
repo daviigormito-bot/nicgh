@@ -1,0 +1,27 @@
+A sua conversa com a Ana Clara (time de vendas) foi excelente, pois respondeu diretamente a quase todas as hipóteses e incertezas que havíamos estruturado anteriormente sobre o projeto da LASA. 
+
+Aqui está o resumo das perguntas e respostas, já adaptado para o contexto da nossa análise de eficiência de ROI e alocação de verbas:
+
+**1. Como funciona a mecânica de desconto no inventário (Repasse)?**
+*   **Dúvida anterior:** O desconto é aplicado no preço dos produtos já inventariados ou apenas nas novas compras?
+*   **Resposta:** O desconto (rebate) é aplicado **diretamente sobre a unidade vendida na loja (sellout)** [1, 2]. Ou seja, não importa quando o produto foi comprado pelo cliente (inventário), o investimento rebate o valor no momento em que ele sai para o consumidor final [2]. Além disso, houve uma mudança importante: até julho, a geração da verba de investimento ocorria em cima do *sellout*, mas **a partir de agosto/setembro, a geração passou a ser sobre o *sellin* (compras da LASA)** [3].
+
+**2. Por que *Baby Wipes* consome tanto investimento e parece ter um ROI pior?**
+*   **Dúvida anterior:** O nível de investimento em *Wipes* faz sentido, sendo que consome muito mais do que *Super SEC* ou *Comfort SEC*?
+*   **Resposta:** Faz sentido estrategicamente porque a **LASA é o maior cliente de lencinhos da P&G**, representando cerca de um quarto das vendas da categoria *Baby* [4, 5]. O problema é que o preço regular do produto na ponta é muito alto (acima de R\$ 45) [5]. Para atingir os preços promocionais (ex: R\$ 32 ou R\$ 33), a P&G precisa injetar um investimento alto, mas a sensibilidade do consumidor compensa: **quando *Wipes* entra em promoção, o volume de vendas chega a multiplicar de 4 a 5 vezes** [5-7]. 
+
+**3. Por que estamos gastando menos com *Comfort SEC* e limitando o investimento em *Premium Care* (que tem o melhor ROI)?**
+*   **Dúvida anterior:** Se *Premium Care* e *Comfort SEC* deveriam ser focos e possuem ROIs melhores, por que não investimos mais neles e tiramos de *Wipes*?
+*   **Resposta (*Comfort SEC*):** É uma família com preço final muito caro (cerca de R\$ 69 na LASA) [8]. Para que o cliente baixe o preço, ele exige **rebates muito altos (de R\$ 7 a R\$ 16 por unidade)** [9]. Como a verba da P&G é limitada, o dinheiro acaba rápido, impossibilitando manter a *Comfort SEC* em promoção por muitos dias [8, 10].
+*   **Resposta (*Premium Care*):** Apesar de ter o melhor ROI e sensibilidade a cada real investido, **ela é a menor parte do negócio em volume** [11, 12]. Se a P&G tirar dinheiro de *Pants* ou de *Wipes* para colocar em *Premium Care*, o volume total de vendas despenca. A estratégia atual é usar a verba gerada por fraldas de Recém-Nascido (RN) para ajudar a financiar a *Premium Care* [12, 13].
+
+**4. O impacto da Sazonalidade (Lag de trimestres)**
+*   **Dúvida anterior:** A distorção no trimestre JS (muito gasto e pouco retorno imediato) era preparação para a Black Friday em ND? Havia distorções anômalas em MJS para *Premium Care*.
+*   **Resposta:** Sim, a sazonalidade afeta drasticamente a leitura do ROI. A **Black Friday ocorre em novembro (trimestre OND)** e exige um planejamento e negociação prévios imensos [14, 15]. O que acontece em JS é que a P&G faz um alto volume de *sellin*, justamente para **gerar uma verba maior de investimento que será queimada no *sellout* de OND** [16]. Quanto às variações atípicas em outros meses, elas são explicadas por grandes eventos da LASA, como o **Festival do Bebê (Fevereiro/Março)**, o Festival do Mercado (Maio/Agosto) e o aniversário da rede em Setembro [16, 17].
+
+**5. Qualidade e disponibilidade dos dados**
+*   **Dúvida anterior:** A LASA possui uma base detalhada de apuração das promoções (como a Araújo) para validarmos se os nossos dados de ROI estão precisos?
+*   **Resposta:** **Sim, o cliente envia as bases de apuração** e a P&G também utiliza um template de redução de preço da companhia para fazer o controle interno e realizar os pagamentos das promoções [1, 18, 19]. Isso significa que é possível cruzar os dados exatos do que foi investido *versus* o preço praticado.
+
+**Conclusão para os seus próximos passos:**
+Essas respostas mostram que **a atual alocação de verba não está necessariamente ineficiente**, mas sim presa a regras de preço e volume (Wipes precisa de investimento constante para gerar giro, Comfort é cara demais para sustentar promoções longas e Premium Care não tem escala para receber o foco do orçamento). Seu modelo de otimização de *sellout* precisará levar em conta o "teto" de dias promocionais que o orçamento suporta para itens muito caros (como *Comfort SEC*) e a alta elasticidade dos produtos mais baratos (como *Wipes*).
