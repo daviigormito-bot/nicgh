@@ -1,0 +1,80 @@
+"""
+Analise de eficiencia de alocacao - Baby Care LASA
+Mede quanto de sellout (MBRL) cada R$1 de pagamento gera por subfamilia,
+e se essa relacao e confiavel (R2).
+
+Requisito: pip install pandas numpy openpyxl
+"""
+
+import pandas as pd
+import numpy as np
+
+# ----------------------------------------------------------------------
+# 1) CONFIGURACAO - ajuste apenas estas linhas
+# ----------------------------------------------------------------------
+CAMINHO = r"C:\caminho\para\sua\base.xlsx"   # caminho do Excel
+ABA     = "Sheet2"                           # nome da aba onde esta a base
+
+# Colunas da SUA planilha -> nome usado no codigo.
+COLUNAS = {
+    'Sub Category':         'Sub Category',
+    'Month (Real)':         'Month',
+    'Sum of Sell Out MBRL': 'MBRL',   # sellout em R$
+    'Sum of TFI M':         'TFI',    # geracao - metodo 1
+    'Sum of LR M':          'LR',     # geracao - metodo 2 (Love Rate)
+    'PAGAMENTOS':           'PAG',    # pagamentos / investimento
+}
+
+# ----------------------------------------------------------------------
+# 2) LEITURA E LIMPEZA
+# ----------------------------------------------------------------------
+df = pd.read_excel(CAMINHO, sheet_name=ABA)
+df = df.rename(columns=COLUNAS)[list(COLUNAS.values())]
+
+# Numeros: a base usa virgula como decimal e NAO tem ponto de milhar.
+# Basta trocar virgula por ponto. Vazio -> 0.
+for c in ['MBRL', 'TFI', 'LR', 'PAG']:
+    df[c] = (df[c].astype(str)
+                  .str.replace(',', '.', regex=False)
+                  .str.strip())
+    df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+# ----------------------------------------------------------------------
+# 3) TABELA DE EFICIENCIA POR SUBFAMILIA
+# ----------------------------------------------------------------------
+linhas = []
+for sub in df['Sub Category'].dropna().unique():
+    s = df[df['Sub Category'] == sub]
+
+    pag_tot     = s['PAG'].sum()
+    ger_tot     = s['TFI'].sum() + s['LR'].sum()     # geracao = TFI + Love Rate
+    sellout_tot = s['MBRL'].sum()
+
+    roi_medio = sellout_tot / pag_tot if pag_tot else np.nan
+
+    # Eficiencia marginal: reta MBRL = a + b*PAG
+    #   b  = sellout adicional por R$1 pago a mais
+    #   R2 = quanto o pagamento explica o sellout (0 a 1)
+    validos = s[(s['PAG'] != 0) | (s['MBRL'] != 0)]
+    if len(validos) >= 4 and validos['PAG'].std() > 0:
+        b, a = np.polyfit(validos['PAG'], validos['MBRL'], 1)
+        r2   = np.corrcoef(validos['PAG'], validos['MBRL'])[0, 1] ** 2
+    else:
+        b, r2 = np.nan, np.nan
+
+    linhas.append({
+        'Subfamilia':           sub,
+        'PAG_total':            round(pag_tot),
+        'Geracao_TFI+LR':       round(ger_tot),
+        'Pag_%_da_Geracao':     round(pag_tot / ger_tot * 100) if ger_tot else np.nan,
+        'Sellout_total':        round(sellout_tot),
+        'ROI_medio':            round(roi_medio, 1) if pag_tot else np.nan,
+        'Sellout_por_R$1_pago': round(b, 2),
+        'R2_confianca':         round(r2, 2),
+    })
+
+tabela = (pd.DataFrame(linhas)
+            .sort_values('Sellout_por_R$1_pago', ascending=False, na_position='last'))
+
+print(tabela.to_string(index=False))
+# tabela.to_excel(r"C:\caminho\resultado.xlsx", index=False)
