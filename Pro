@@ -1,0 +1,20 @@
+Você é analista de Sales Finance. Vou colar uma base mensal de Baby Care com sell-in, sell-out, dias de promoção e investimentos por MG5. Monte um arquivo Excel (.xlsx) com três abas.
+
+ABA "Base": a base colada como Tabela (tblBase), mais duas colunas novas:
+- Subcat_Consolidada: agrupa MG5 935 e 760 como PANTS AT, 876 e 473 como SUPERSEC, 20 e 21 como BABY WIPES. São transições de SKU, não subcategorias distintas.
+- Flag_Qualidade: "Mudança de UM" no MG5 20 a partir de 2025M11 (preço unitário cai de R$13,50 para R$2,68); "Rateio linear" nas linhas de pagamento sell-in de 2025M10 e 2025M11 (valor idêntico, é rateio da janela 02/10–31/12, não gasto real).
+
+ABA "Cálculo": colunas por linha, com SEERRO em todas:
+- Unid_dia_base = unid. em dias-base / dias-base
+- Unid_dia_promo = unid. em dias de promo / dias em promoção
+- Uplift = Unid_dia_promo / Unid_dia_base
+- Incremental_RS = (Unid_dia_promo - Unid_dia_base) * dias em promoção * (R$ em dias de promo / unid. em dias de promo)
+- ROI = Incremental_RS / Pagamento do mês
+- Rebate_pct = Pagamento do mês / R$ em dias de promo
+- SI_acum e SO_acum por Subcat_Consolidada via SOMASES com critério Mês "<="&[@Mês]; Razao_SI_SO = SI_acum / SO_acum
+
+Use o baseline de dias-base do próprio mês, não o "ex-Nov" da planilha.
+
+ABA "Resumo": dinâmica por Subcat_Consolidada (sell-out R$, sell-in R$, razão, pagamento sell-out, pagamento sell-in, ROI) e tabela de ROI por MG5 em ordem decrescente. Formatação condicional na razão: verde <1,2, amarelo 1,2–1,5, vermelho >1,5. Caixa de texto visível no canto com as ressalvas de qualidade da base. Três gráficos: combinado de sell-in e sell-out acumulados com a razão no eixo secundário; barras horizontais de ROI por MG5 com linha de referência em 1,0; dispersão de profundidade de desconto (X) contra uplift (Y), um ponto por MG5-mês.
+
+Fórmulas vivas nas células, não valores colados. Sem emojis. Português do Brasil.
