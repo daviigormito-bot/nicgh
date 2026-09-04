@@ -1,0 +1,28 @@
+# DESCONTO COMO FUNCAO DO INVESTIMENTO (agora t importa):
+    # d(t) = desc_ref + [g(t) - g(t_ref)], onde g e a relacao t->desconto calibrada
+    # em calibrar_t_d (regressao do proprio EAN quando ha variacao suficiente, senao
+    # o piso teorico t/(1+t)). Ancoragem: em t = t_ref o desconto e exatamente
+    # desc_ref, entao o volume projetado bate com o dQ historico; acima/abaixo disso
+    # o volume responde pela elasticidade do item. Sem essa dependencia de t o termo
+    # ((1-d)/(1-desc_ref))**e vira 1 e a elasticidade nao afeta a alocacao.
+    def _mk_f(dref, tref, g):
+        def f(t, dref=float(dref), tref=float(tref), g=g):
+            return float(np.clip(dref + (g(t) - g(tref)), 0.0, DESC_MAX_CAP))
+        return f
+    g_pad = lambda t: float(np.clip(t/(1+t) if t>=0 else 0.0, 0, 1))
+    cons["f_t_to_d"] = [_mk_f(r["desc_ref"], r["t_ref"], rel.get(r["EAN"], g_pad))
+                        for r in cons.to_dict("records")]
+    return cons
+
+
+di,ds,dc,st,inv_bruto=metrica_em_t(r,e,t)
+                # piso de preco checado NESTE t: como o desconto agora varia com o
+                # investimento, o preco praticado tambem varia e o limite superior
+                # de t passa a ser o preco da ultima DLI (comportamento pretendido).
+                if (PRECO_NAO_ABAIXO_ULTIMA_DLI and not pd.isna(r.get("preco_ult_dli"))
+                        and r["preco_base"]*(1-dc) <= r["preco_ult_dli"]):
+                    linha.append(None); continue
+roi=ds/di if di>0 else -np.inf
+
+
+"preco_praticado_PROX_DLI":round(float(r["preco_base"]*(1-dc)),2),
