@@ -1,0 +1,199 @@
+# ------------------------- alocacao por Lagrange -------------------------
+def metrica_em_t(r,e,t):
+    st=sellout_tot(t,r["preco_base"],r["vol_base"],max(r["dQ"],0),r["desc_ref"],e,r["f_t_to_d"])
+    inv_bruto=inv_bruto_tot(t,r["preco_base"],r["vol_base"],max(r["dQ"],0),r["desc_ref"],e,r["f_t_to_d"])
+    di=inv_bruto-r["inv_base"]
+    ds=st-r["sellout_base"]
+    dc=r["f_t_to_d"](t)
+    return di,ds,dc,st,inv_bruto
+
+def alocar_lagrange(cons,teto,elast,cenario="A",n_grid=161):
+    cons=cons[~cons["CATEGORIA"].isin(CATEGORIAS_DESCARTADAS)].copy()
+    grupos={}; cortados=[]
+
+    for mg5,gdf in cons.groupby("MG5"):
+        membros=[]
+        for r in gdf.to_dict("records"):
+            ev=elast.get(r["EAN"],(ELASTICIDADE_BASE,"4-global"))
+            r["_elast_origem"]=ev[1]
+            membros.append((r,ev[0]))
+        invu_lo=min(r["invu_min"] for r,_ in membros)
+        invu_hi=max(r["invu_max"] for r,_ in membros)
+        if not np.isfinite(invu_lo) or not np.isfinite(invu_hi) or invu_hi<=0:
+            grupos[mg5]=None; continue
+        grade_invu=np.linspace(max(invu_lo,1e-4), max(invu_hi,invu_lo+1e-4), n_grid)
+        info=[]
+        for r,e in membros:
+            prot=_mg5_protegido(mg5)
+            preco_ok=bool(r.get("preco_ok",True))
+            linha=[]
+            for invu in grade_invu:
+                t = invu/r["preco_base"] if r["preco_base"]>0 else np.nan
+                if (not np.isfinite(t) or invu<r["invu_min"]-1e-9 or invu>r["invu_max"]+1e-9
+                        or not preco_ok):
+                    linha.append(None); continue
+                di,ds,dc,st,inv_bruto=metrica_em_t(r,e,t)
+                # piso de preco checado NESTE t: como o desconto varia com o
+                # investimento, o preco praticado tambem varia e o limite superior
+                # de t passa a ser o preco da ultima DLI.
+                if (PRECO_NAO_ABAIXO_ULTIMA_DLI and not pd.isna(r.get("preco_ult_dli"))
+                        and r["preco_base"]*(1-dc) <= r["preco_ult_dli"]):
+                    linha.append(None); continue
+                roi=ds/di if di>0 else -np.inf
+                ok_roi = (di>0 and ds>0 and roi>1.0)
+                pos = (ds>0)
+                linha.append((di,ds,roi,dc,ok_roi,pos,st,inv_bruto,float(t),float(invu)))
+            info.append((r,e,prot,linha))
+        grupos[mg5]=(info,grade_invu)
+
+    # -------- COBERTURA OBRIGATORIA DE CATEGORIAS (dentro da restricao) --------
+    # Precomputa, para cada MG5, o MELHOR ponto viavel por ROI do grupo. Nao
+    # depende de lambda, entao e calculado uma vez so. Depois elege, por
+    # CATEGORIA, o MG5 de melhor ROI como candidato ao resgate obrigatorio.
+    def melhor_ponto_grupo(pack):
+        if pack is None: return None
+        info,grade=pack; n_itens=len(info); best=None
+        for j in range(len(grade)):
+            membros=[]; sum_di=0.0; sum_ds=0.0; gasto=0.0; ok=True
+            for (r,e,prot,linha) in info:
+                cell=linha[j]
+                if cell is None: ok=False; break
+                di,ds,roi,dc,ok_roi,pos,st,inv_bruto,t_i,invu=cell
+                sum_di+=di; sum_ds+=ds; gasto+=inv_bruto
+                membros.append((r,e,di,ds,roi,dc,prot,st,inv_bruto,t_i,invu))
+            if not ok or len(membros)<n_itens: continue
+            roi_g=(sum_ds/sum_di) if sum_di>0 else -np.inf
+            if best is None or roi_g>best[0]:
+                best=(roi_g,float(grade[j]),membros,gasto)
+        return best
+
+    forcado_cat={}
+    if OBRIGAR_TODAS_CATEGORIAS:
+        cat_mg5=cons.groupby("MG5")["CATEGORIA"].first().to_dict()
+        for mg5,pack in grupos.items():
+            cat=cat_mg5.get(mg5)
+            if pd.isna(cat): continue
+            b=melhor_ponto_grupo(pack)
+            if b is None: continue
+            if cat not in forcado_cat or b[0]>forcado_cat[cat][1][0]:
+                forcado_cat[cat]=(mg5,b)
+        todas=set(cons["CATEGORIA"].dropna().unique())
+        sem_opcao=sorted(todas-set(forcado_cat))
+        for c in sem_opcao:
+            print(f"[cobertura] CATEGORIA '{c}' sem nenhum MG5 viavel - impossivel garantir presenca")
+        piso_obrig=sum(b[3] for _,b in forcado_cat.values())
+        if piso_obrig>teto:
+            print(f"[cobertura] AVISO: o custo minimo para cobrir todas as categorias "
+                  f"(R$ {piso_obrig:,.2f}) ja supera o teto (R$ {teto:,.2f}). "
+                  "Nenhuma solucao respeita o teto com a cobertura obrigatoria ligada.")
+
+    def avalia(lam):
+        gasto_bruto=0.0; escolhas={}
+        for mg5,pack in grupos.items():
+            if pack is None: continue
+            info,grade_invu=pack
+            n_itens=len(info)
+            protegido = any(prot for (_,_,prot,_) in info)
+            best=None; best_prot=None
+            for j in range(len(grade_invu)):
+                membros=[]; soma_lag=0.0; gasto_t=0.0
+                todos_viaveis=True; sum_di=0.0; sum_ds=0.0; todos_pos=True
+                for (r,e,prot,linha) in info:
+                    cell=linha[j]
+                    if cell is None:
+                        todos_viaveis=False; break
+                    di,ds,roi,dc,ok_roi,pos,st,inv_bruto,t_i,invu=cell
+                    sum_di+=di; sum_ds+=ds
+                    todos_pos = todos_pos and pos
+                    soma_lag+=ds-lam*inv_bruto; gasto_t+=inv_bruto
+                    membros.append((r,e,di,ds,roi,dc,prot,st,inv_bruto,t_i,invu))
+                if not todos_viaveis or len(membros)<n_itens:
+                    continue
+                roi_grupo = (sum_ds/sum_di) if sum_di>0 else -np.inf
+                if not (sum_di>0 and roi_grupo>1.0):
+                    continue
+                if cenario=="A" and not todos_pos:
+                    continue
+                if best is None or soma_lag>best[0]:
+                    best=(soma_lag,float(grade_invu[j]),membros,gasto_t)
+                if best_prot is None or sum_ds>best_prot[0]:
+                    best_prot=(sum_ds,float(grade_invu[j]),membros,gasto_t)
+            if protegido:
+                if best_prot is not None:
+                    escolhas[mg5]=(best_prot[1],best_prot[2]); gasto_bruto+=best_prot[3]
+            else:
+                if best is not None and best[0]>0:
+                    escolhas[mg5]=(best[1],best[2]); gasto_bruto+=best[3]
+
+        # resgate obrigatorio DENTRO da avaliacao: o gasto dos grupos forcados
+        # entra na mesma conta que a bissecao compara com o teto, entao lambda
+        # sobe e a carteira discricionaria encolhe para pagar a cobertura.
+        if OBRIGAR_TODAS_CATEGORIAS and forcado_cat:
+            cobertas=set()
+            for _,membros_ok in escolhas.values():
+                for m in membros_ok:
+                    cobertas.add(m[0]["CATEGORIA"])
+            for cat,(mg5,b) in forcado_cat.items():
+                if cat in cobertas or mg5 in escolhas: continue
+                escolhas[mg5]=(b[1],b[2]); gasto_bruto+=b[3]
+        return gasto_bruto,escolhas
+
+    lo,hi=0.0,500.0
+    for _ in range(90):
+        mid=(lo+hi)/2; g,_=avalia(mid)
+        if g>teto: lo=mid
+        else: hi=mid
+    lam=hi; gbruto,escolhas=avalia(lam)
+    if gbruto>teto*1.0001:
+        print(f"[cobertura] cenario {cenario}: gasto final R$ {gbruto:,.2f} acima do teto "
+              f"R$ {teto:,.2f} - o piso da cobertura obrigatoria nao cabe no orcamento")
+
+    ativos=set(); aloc=[]
+    for mg5,(invu_grupo,membros_ok) in escolhas.items():
+        for (r,e,di,ds,roi,dc,pr,st,inv_bruto,t_i,invu) in membros_ok:
+            ativos.add(r["EAN"])
+            k_ult = float(r["K_ult_dli"]) if not pd.isna(r["K_ult_dli"]) else np.nan
+            aloc.append({
+                "EAN":r["EAN"],"PRODUTO":r["PRODUTO"],"CATEGORIA":r["CATEGORIA"],
+                "SUB":r["SUB"],"MG5":mg5,"n_safras":int(r["n_safras"]),
+                "elasticidade":round(float(e),3),
+                "elast_origem":r.get("_elast_origem","4-global"),
+                "K_RECOMENDADO":round(float(t_i),4),
+                "K_ULTIMA_DLI":round(k_ult,4) if not np.isnan(k_ult) else np.nan,
+                "invest_por_unidade_PROJ":round(float(invu),4),
+                "invest_por_unidade_ULTIMA_DLI":round(float(r["inv_unit_ult_dli"]),4) if not pd.isna(r.get("inv_unit_ult_dli")) else np.nan,
+                "desc_consumidor_PROJ":round(float(dc),4),
+                "carga_tributaria":round(float(r["carga_tributaria"]),4),
+                "desc_max_ult_dli":round(float(r["desc_max_dli"]),4) if not pd.isna(r.get("desc_max_dli")) else np.nan,
+                "preco_base_reaj_PROJ":round(r["preco_base"],2),
+                "origem_preco_base":r.get("origem_preco_base","fallback_+7%"),
+                "preco_praticado_PROX_DLI":round(float(r["preco_base"]*(1-dc)),2),
+                "preco_ULTIMA_DLI":round(float(r["preco_ult_dli"]),2) if not pd.isna(r["preco_ult_dli"]) else np.nan,
+                "ano_ULTIMA_DLI":int(r["ano_ult_dli"]) if not pd.isna(r["ano_ult_dli"]) else np.nan,
+                "investimento_bruto_PROJ":round(float(inv_bruto),2),
+                "investimento_bruto_ULTIMA_DLI":round(float(r["inv_ult_dli"]),2) if not pd.isna(r["inv_ult_dli"]) else np.nan,
+                "sellout_bruto_PROJ":round(float(st),2),
+                "sellout_bruto_ULTIMA_DLI":round(float(r["sellout_ult_dli"]),2) if not pd.isna(r["sellout_ult_dli"]) else np.nan,
+                # --- VALOR DE REFERENCIA (baseline medio por EAN) usado no incremental ---
+                "sellout_REFERENCIA":round(float(r["sellout_base"]),2) if not pd.isna(r.get("sellout_base")) else np.nan,
+                "investimento_REFERENCIA":round(float(r["inv_base"]),2) if not pd.isna(r.get("inv_base")) else np.nan,
+                "dInvestimento_PROJ":round(float(di),2),
+                "dSellout_PROJ":round(float(ds),2),
+                "ROI_incremental_PROJ":round(float(roi),3),
+                "item_puxado_pelo_grupo": bool(roi<=1.0),
+            })
+    for r in cons.to_dict("records"):
+        if r["EAN"] not in ativos:
+            mot=("MG5 com ROI agregado <=1 ou item com dSellout<=0" if cenario=="A"
+                 else "MG5 com ROI agregado <=1, ou sem inv_unit comum viavel (preco/faixa)")
+            cortados.append({"EAN":r["EAN"],"PRODUTO":r["PRODUTO"],"MG5":r["MG5"],"motivo":mot})
+    df_a=pd.DataFrame(aloc)
+    if len(df_a):
+        roi_mg5=df_a.groupby("MG5").apply(
+            lambda g: g["dSellout_PROJ"].sum()/g["dInvestimento_PROJ"].sum()
+            if g["dInvestimento_PROJ"].sum()>0 else np.nan, include_groups=False).rename("ROI_MG5_PROJ")
+        df_a=df_a.merge(roi_mg5, on="MG5", how="left")
+        df_a=df_a.sort_values(["MG5","ROI_incremental_PROJ"],ascending=[True,False])
+    verba_incr=df_a["dInvestimento_PROJ"].sum() if len(df_a) else 0.0
+    verba_bruta=df_a["investimento_bruto_PROJ"].sum() if len(df_a) else 0.0
+    return df_a,pd.DataFrame(cortados),verba_incr,verba_bruta,lam
