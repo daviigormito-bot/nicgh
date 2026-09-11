@@ -1,0 +1,2796 @@
+# ============================================================
+# MODELO DE MROI - REVENUE GROWTH MANAGEMENT / FMCG
+# ============================================================
+#
+# Objetivo:
+# Calcular o retorno marginal financeiro da verba de Sell-Out,
+# expresso em R$ de lucro incremental por R$ 1 de verba.
+#
+# O modelo integra:
+#   1. Margem da indústria
+#   2. ROI de Sell-Out
+#   3. Conversão de Sell-Out para receita da indústria (alfa)
+#   4. Desequilíbrio de estoque (SI/SO)
+#   5. Saturação promocional
+#   6. Elasticidade
+#   7. Otimização da verba
+#
+# ============================================================
+
+
+# ============================================================
+# 0. CONFIGURAÇÃO PRINCIPAL
+# ============================================================
+
+# >>>>>> ALTERE SOMENTE ESTA LINHA <<<<<<
+ARQUIVO_BASE = r"C:\Users\SEU_USUARIO\Desktop\base_promocoes.xlsx"
+
+# Nome da aba.
+# Pode ser 0 para pegar a primeira aba.
+ABA_EXCEL = 0
+
+# Nome do arquivo final gerado pelo modelo
+ARQUIVO_SAIDA = "resultado_mroi.xlsx"
+
+# Se True, o modelo obriga a utilizar todo o orçamento.
+# Se False, o modelo pode deixar parte do orçamento sem gastar
+# caso não exista retorno marginal positivo.
+OBRIGAR_GASTAR_TODO_ORCAMENTO = False
+
+# Orçamento total disponível.
+# Coloque 0 para apenas analisar o MROI sem fazer otimização.
+ORCAMENTO_TOTAL = 0.0
+
+# ------------------------------------------------------------
+# Conversão de IT para unidade física de Sell-Out
+# ------------------------------------------------------------
+#
+# O modelo inicialmente assume:
+#
+#     1 IT = 1 unidade
+#
+# Se isso estiver errado para algum MG5, altere no dicionário.
+#
+FATOR_IT_UNID_PADRAO = 1.0
+
+FATOR_IT_UNID_POR_MG5 = {
+    # Exemplo:
+    # "20": 1.0,
+    # "21": 1.0,
+    # "473": 1.0,
+}
+
+# ------------------------------------------------------------
+# Parâmetros de estoque
+# ------------------------------------------------------------
+
+JANELA_ESTOQUE = 3
+
+# Calibração:
+# quando SI/SO = 1.5 ou 1/1.5,
+# o fator de estoque será 60%
+R_ESTOQUE_STAR = 1.5
+F_ESTOQUE_STAR = 0.60
+
+# ------------------------------------------------------------
+# Parâmetros de alfa
+# ------------------------------------------------------------
+
+JANELA_ALFA = 6
+
+# ------------------------------------------------------------
+# Parâmetros de saturação
+# ------------------------------------------------------------
+
+# Opção:
+# "calibrado" = recomendada para amostra pequena
+# "estimado"  = estima kappa pela base
+# "fixo"      = usa valor informado abaixo
+METODO_KAPPA = "calibrado"
+
+# Calibração:
+#
+# Quando:
+#     elasticidade × intensidade promocional = CARGA_STAR
+#
+# queremos que:
+#
+#     retorno marginal / retorno médio = F_SATURACAO_STAR
+#
+CARGA_PROMOCIONAL_STAR = 1.0
+F_SATURACAO_STAR = 0.70
+
+# Se METODO_KAPPA = "fixo"
+KAPPA_FIXO = 0.6755
+
+# ------------------------------------------------------------
+# Extensão econômica
+# ------------------------------------------------------------
+
+# Verba marginal adicional de Sell-In por R$ de Sell-Out.
+#
+# Exemplo:
+#
+# eta = 0.10
+#
+# significa que cada R$ 1 de verba SO exige R$ 0,10
+# adicionais de verba SI.
+#
+ETA_PADRAO = 0.0
+
+# Fração de antecipação de compra.
+# Neste modelo principal ela é 0.
+#
+# Pode ser usada posteriormente em uma extensão de portfólio.
+PHI_PADRAO = 0.0
+
+
+# ============================================================
+# 1. BIBLIOTECAS
+# ============================================================
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from scipy.optimize import curve_fit, minimize
+
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 2. PARÂMETROS DE NEGÓCIO
+# ============================================================
+
+MARGENS = {
+    "SUPERSEC": 0.1735,
+    "BABY WIPES": 0.29,
+    "NEWBABY": 0.15,
+    "CONFORTSEC": 0.27,
+    "PANTS AT": 0.31,
+    "PREMIUM CARE": 0.39,
+}
+
+ELASTICIDADES = {
+    "SUPERSEC": 5.0,
+    "BABY WIPES": 3.5,
+    "NEWBABY": 2.0,
+    "CONFORTSEC": 3.0,
+    "PANTS AT": 3.5,
+    "PREMIUM CARE": 3.3,
+}
+
+
+# ============================================================
+# 3. FUNÇÕES AUXILIARES
+# ============================================================
+
+def limpar_texto(valor):
+    """
+    Converte texto para uma forma padronizada.
+    """
+    if pd.isna(valor):
+        return ""
+
+    valor = str(valor).strip().upper()
+
+    return valor
+
+
+def normalizar_subcategoria(valor):
+    """
+    Converte os nomes presentes no Excel para os nomes
+    usados no modelo.
+    """
+
+    valor = limpar_texto(valor)
+
+    mapa = {
+        "BABY CARE - SUPERSEC": "SUPERSEC",
+        "SUPERSEC": "SUPERSEC",
+
+        "BABY WIPES": "BABY WIPES",
+
+        "NEW BABY": "NEWBABY",
+        "NEWBABY": "NEWBABY",
+
+        "CONFORT SEC": "CONFORTSEC",
+        "CONFORTSEC": "CONFORTSEC",
+
+        "PANTS AT": "PANTS AT",
+
+        "PREMIUM CARE": "PREMIUM CARE",
+    }
+
+    return mapa.get(valor, valor)
+
+
+def converter_numero_br(valor):
+    """
+    Converte números brasileiros:
+
+        1.234,56
+        R$ 1.234,56
+        -R$ 1.234,56
+        R$ -
+        -
+
+    para float.
+    """
+
+    if pd.isna(valor):
+        return 0.0
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        return float(valor)
+
+    texto = str(valor).strip()
+
+    if texto == "":
+        return 0.0
+
+    texto_upper = texto.upper()
+
+    if texto_upper in {
+        "-",
+        "R$ -",
+        "R$-",
+        "N/A",
+        "NA",
+        "NULL",
+        "NONE",
+    }:
+        return 0.0
+
+    negativo = False
+
+    if texto.startswith("-"):
+        negativo = True
+        texto = texto[1:].strip()
+
+    if texto.endswith("-"):
+        negativo = True
+        texto = texto[:-1].strip()
+
+    texto = (
+        texto
+        .replace("R$", "")
+        .replace(" ", "")
+    )
+
+    # Formato brasileiro:
+    # 1.234.567,89
+    if "," in texto:
+        texto = texto.replace(".", "")
+        texto = texto.replace(",", ".")
+
+    # Formato sem vírgula:
+    # 1234567
+    try:
+        numero = float(texto)
+    except ValueError:
+        return np.nan
+
+    if negativo:
+        numero *= -1
+
+    return numero
+
+
+def dividir_seguro(a, b):
+    """
+    Divisão protegida contra zero.
+    """
+
+    if isinstance(a, pd.Series):
+        a = a.astype(float)
+
+    if isinstance(b, pd.Series):
+        b = b.astype(float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        resultado = a / b
+
+    if isinstance(resultado, pd.Series):
+        resultado = resultado.replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+
+    elif np.isscalar(resultado):
+        if not np.isfinite(resultado):
+            return np.nan
+
+    return resultado
+
+
+# ============================================================
+# 4. LEITURA DO EXCEL
+# ============================================================
+
+def ler_excel(caminho, aba=0):
+
+    caminho = Path(caminho)
+
+    if not caminho.exists():
+        raise FileNotFoundError(
+            f"\nArquivo não encontrado:\n{caminho}\n\n"
+            "Verifique a variável ARQUIVO_BASE no início do código."
+        )
+
+    print("=" * 70)
+    print("LENDO BASE")
+    print("=" * 70)
+
+    print(f"Arquivo: {caminho}")
+
+    df = pd.read_excel(
+        caminho,
+        sheet_name=aba
+    )
+
+    print(f"Linhas lidas: {len(df):,}")
+    print(f"Colunas lidas: {len(df.columns):,}")
+
+    return df
+
+
+# ============================================================
+# 5. PADRONIZAÇÃO DAS COLUNAS
+# ============================================================
+
+def encontrar_coluna(df, candidatos, obrigatoria=True):
+
+    colunas = list(df.columns)
+
+    mapa = {
+        str(c).strip().lower(): c
+        for c in colunas
+    }
+
+    for candidato in candidatos:
+
+        chave = candidato.strip().lower()
+
+        if chave in mapa:
+            return mapa[chave]
+
+    # Busca aproximada
+    for candidato in candidatos:
+
+        candidato_lower = candidato.strip().lower()
+
+        for coluna in colunas:
+
+            coluna_lower = str(coluna).strip().lower()
+
+            if candidato_lower in coluna_lower:
+                return coluna
+
+    if obrigatoria:
+        raise KeyError(
+            "\nNão foi possível encontrar uma coluna obrigatória.\n"
+            f"Candidatos procurados: {candidatos}\n"
+            f"Colunas disponíveis:\n{colunas}"
+        )
+
+    return None
+
+
+def padronizar_colunas(df):
+
+    print("\nPadronizando colunas...")
+
+    mapeamento = {}
+
+    mapeamento["mes"] = encontrar_coluna(
+        df,
+        ["Mês"]
+    )
+
+    mapeamento["mg5"] = encontrar_coluna(
+        df,
+        ["MG5"]
+    )
+
+    mapeamento["data"] = encontrar_coluna(
+        df,
+        ["data"]
+    )
+
+    mapeamento["subcategoria"] = encontrar_coluna(
+        df,
+        ["Subcategoria"]
+    )
+
+    mapeamento["sell_out_unid"] = encontrar_coluna(
+        df,
+        ["Sell-out unid. mês"]
+    )
+
+    mapeamento["sell_out_rs"] = encontrar_coluna(
+        df,
+        ["Sell-out R$ mês"]
+    )
+
+    mapeamento["pagamento_so"] = encontrar_coluna(
+        df,
+        ["Pagamento do mês (R$)"]
+    )
+
+    mapeamento["incremental_unid_so"] = encontrar_coluna(
+        df,
+        ["Incremental unid. (baseline ex-Nov)"]
+    )
+
+    mapeamento["incremental_rs_so"] = encontrar_coluna(
+        df,
+        ["Incremental R$ (baseline ex-Nov)"],
+        obrigatoria=True
+    )
+
+    mapeamento["sell_in_qtd_it"] = encontrar_coluna(
+        df,
+        ["Sell-in Qtd IT mês"]
+    )
+
+    mapeamento["sell_in_rs"] = encontrar_coluna(
+        df,
+        ["Sell-in R$ mês"]
+    )
+
+    mapeamento["pagamento_si"] = encontrar_coluna(
+        df,
+        ["Pagamento sell-in alocado (R$)"]
+    )
+
+    # A planilha possui o segundo "Incremental R$ (baseline ex-Nov)"
+    # referente ao Sell-In. O Pandas normalmente transforma o segundo
+    # cabeçalho em "... .1".
+    mapeamento["incremental_rs_si"] = encontrar_coluna(
+        df,
+        [
+            "Incremental R$ (baseline ex-Nov).1",
+            "Incremental R$ (baseline ex-Nov)",
+        ],
+        obrigatoria=False
+    )
+
+    # Incremental Qtd IT do sell-in
+    mapeamento["incremental_qtd_it_si"] = encontrar_coluna(
+        df,
+        ["Incremental Qtd IT (baseline ex-Nov)"],
+        obrigatoria=False
+    )
+
+    return mapeamento
+
+
+# ============================================================
+# 6. PREPARAÇÃO DA BASE
+# ============================================================
+
+def preparar_base(df):
+
+    mapa = padronizar_colunas(df)
+
+    novo = pd.DataFrame()
+
+    novo["mes"] = df[mapa["mes"]]
+    novo["mg5"] = df[mapa["mg5"]]
+    novo["data"] = pd.to_datetime(
+        df[mapa["data"]],
+        errors="coerce"
+    )
+
+    novo["subcategoria_original"] = (
+        df[mapa["subcategoria"]]
+    )
+
+    novo["subcategoria"] = (
+        df[mapa["subcategoria"]]
+        .apply(normalizar_subcategoria)
+    )
+
+    colunas_numericas = {
+        "sell_out_unid": "sell_out_unid",
+        "sell_out_rs": "sell_out_rs",
+        "pagamento_so": "pagamento_so",
+        "incremental_unid_so": "incremental_unid_so",
+        "incremental_rs_so": "incremental_rs_so",
+        "sell_in_qtd_it": "sell_in_qtd_it",
+        "sell_in_rs": "sell_in_rs",
+        "pagamento_si": "pagamento_si",
+    }
+
+    if mapa["incremental_rs_si"] is not None:
+        colunas_numericas[
+            "incremental_rs_si"
+        ] = "incremental_rs_si"
+
+    if mapa["incremental_qtd_it_si"] is not None:
+        colunas_numericas[
+            "incremental_qtd_it_si"
+        ] = "incremental_qtd_it_si"
+
+    for destino, origem in colunas_numericas.items():
+
+        col_original = mapa[
+            origem
+        ]
+
+        novo[destino] = (
+            df[col_original]
+            .apply(converter_numero_br)
+        )
+
+    # Caso não exista coluna explícita de incremental SI
+    if "incremental_rs_si" not in novo.columns:
+
+        novo["incremental_rs_si"] = 0.0
+
+    if "incremental_qtd_it_si" not in novo.columns:
+
+        novo["incremental_qtd_it_si"] = 0.0
+
+    # MG5 como texto
+    novo["mg5"] = (
+        novo["mg5"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    # Ordenação
+    novo = novo.sort_values(
+        [
+            "subcategoria",
+            "mg5",
+            "data"
+        ]
+    ).reset_index(drop=True)
+
+    return novo
+
+
+# ============================================================
+# 7. FATOR IT -> UNIDADE
+# ============================================================
+
+def adicionar_fator_it_unidade(df):
+
+    df["fator_it_unid"] = (
+        df["mg5"]
+        .map(FATOR_IT_UNID_POR_MG5)
+        .fillna(FATOR_IT_UNID_PADRAO)
+    )
+
+    df["si_eq"] = (
+        df["sell_in_qtd_it"]
+        * df["fator_it_unid"]
+    )
+
+    return df
+
+
+# ============================================================
+# 8. BASELINE E INTENSIDADE PROMOCIONAL
+# ============================================================
+
+def calcular_variaveis_basicas(df):
+
+    # Baseline financeiro de Sell-Out
+    df["baseline_rs"] = (
+        df["sell_out_rs"]
+        - df["incremental_rs_so"]
+    )
+
+    # Impede baseline negativo para cálculo da intensidade.
+    df["baseline_rs_calculo"] = (
+        df["baseline_rs"]
+        .where(df["baseline_rs"] > 0)
+    )
+
+    # Intensidade promocional
+    df["z"] = dividir_seguro(
+        df["pagamento_so"],
+        df["baseline_rs_calculo"]
+    )
+
+    # Preço médio do Sell-Out
+    df["preco_so"] = dividir_seguro(
+        df["sell_out_rs"],
+        df["sell_out_unid"]
+    )
+
+    # Preço médio do Sell-In
+    df["preco_si"] = dividir_seguro(
+        df["sell_in_rs"],
+        df["si_eq"]
+    )
+
+    # ROI médio observado do Sell-Out
+    df["roi_so"] = dividir_seguro(
+        df["incremental_rs_so"],
+        df["pagamento_so"]
+    )
+
+    # Quando não houve verba, ROI não existe
+    df.loc[
+        df["pagamento_so"] <= 0,
+        "roi_so"
+    ] = np.nan
+
+    return df
+
+
+# ============================================================
+# 9. ALFA
+# ============================================================
+
+def calcular_alfa(df, janela=6):
+
+    """
+    Calcula o fator:
+
+        alfa =
+        preço líquido SI / preço SO
+
+    utilizando média móvel por subcategoria/MG5.
+
+    Depois consolida por subcategoria usando o baseline
+    como peso.
+
+    """
+
+    dados = df.copy()
+
+    dados["preco_si"] = dividir_seguro(
+        dados["sell_in_rs"],
+        dados["si_eq"]
+    )
+
+    dados["preco_so"] = dividir_seguro(
+        dados["sell_out_rs"],
+        dados["sell_out_unid"]
+    )
+
+    dados["alfa_mg5"] = dividir_seguro(
+        dados["preco_si"],
+        dados["preco_so"]
+    )
+
+    dados = dados.sort_values(
+        [
+            "subcategoria",
+            "mg5",
+            "data"
+        ]
+    )
+
+    grupos = (
+        dados
+        .groupby(
+            [
+                "subcategoria",
+                "mg5"
+            ],
+            group_keys=False
+        )
+    )
+
+    dados["si_rs_movel"] = (
+        grupos["sell_in_rs"]
+        .transform(
+            lambda s:
+            s.rolling(
+                janela,
+                min_periods=1
+            ).sum()
+        )
+    )
+
+    dados["si_eq_movel"] = (
+        grupos["si_eq"]
+        .transform(
+            lambda s:
+            s.rolling(
+                janela,
+                min_periods=1
+            ).sum()
+        )
+    )
+
+    dados["so_rs_movel"] = (
+        grupos["sell_out_rs"]
+        .transform(
+            lambda s:
+            s.rolling(
+                janela,
+                min_periods=1
+            ).sum()
+        )
+    )
+
+    dados["so_unid_movel"] = (
+        grupos["sell_out_unid"]
+        .transform(
+            lambda s:
+            s.rolling(
+                janela,
+                min_periods=1
+            ).sum()
+        )
+    )
+
+    dados["preco_si_movel"] = dividir_seguro(
+        dados["si_rs_movel"],
+        dados["si_eq_movel"]
+    )
+
+    dados["preco_so_movel"] = dividir_seguro(
+        dados["so_rs_movel"],
+        dados["so_unid_movel"]
+    )
+
+    dados["alfa_movel"] = dividir_seguro(
+        dados["preco_si_movel"],
+        dados["preco_so_movel"]
+    )
+
+    # Último alfa disponível por MG5
+    ultimo = (
+        dados
+        .sort_values("data")
+        .groupby(
+            [
+                "subcategoria",
+                "mg5"
+            ],
+            as_index=False
+        )
+        .tail(1)
+    )
+
+    # Consolidação por subcategoria
+    ultimo["peso"] = (
+        ultimo["baseline_rs"]
+        .clip(lower=0)
+    )
+
+    def alfa_ponderado(grupo):
+
+        pesos = grupo["peso"].to_numpy(
+            dtype=float
+        )
+
+        valores = grupo["alfa_movel"].to_numpy(
+            dtype=float
+        )
+
+        mascara = (
+            np.isfinite(valores)
+            & np.isfinite(pesos)
+            & (pesos > 0)
+        )
+
+        if mascara.sum() == 0:
+
+            valores_validos = valores[
+                np.isfinite(valores)
+            ]
+
+            if len(valores_validos) == 0:
+                return np.nan
+
+            return np.median(
+                valores_validos
+            )
+
+        return np.average(
+            valores[mascara],
+            weights=pesos[mascara]
+        )
+
+    alfa_subcategoria = (
+        ultimo
+        .groupby("subcategoria")
+        .apply(alfa_ponderado)
+        .rename("alfa")
+        .reset_index()
+    )
+
+    return dados, alfa_subcategoria
+
+
+# ============================================================
+# 10. SI/SO
+# ============================================================
+
+def calcular_r_estoque(df, H=3):
+
+    dados = df.copy()
+
+    dados = dados.sort_values(
+        [
+            "subcategoria",
+            "data"
+        ]
+    )
+
+    # Como existem vários MG5 dentro da subcategoria,
+    # primeiro agregamos fisicamente a subcategoria por mês.
+
+    mensal = (
+        dados
+        .groupby(
+            [
+                "subcategoria",
+                "data"
+            ],
+            as_index=False
+        )
+        .agg(
+            si_eq=("si_eq", "sum"),
+            sell_out_unid=("sell_out_unid", "sum"),
+        )
+    )
+
+    mensal = mensal.sort_values(
+        [
+            "subcategoria",
+            "data"
+        ]
+    )
+
+    grupo = (
+        mensal
+        .groupby("subcategoria")
+    )
+
+    # Defasagem de um mês.
+    mensal["si_eq_lag"] = (
+        grupo["si_eq"]
+        .shift(1)
+    )
+
+    mensal["so_unid_lag"] = (
+        grupo["sell_out_unid"]
+        .shift(1)
+    )
+
+    grupo_lag = (
+        mensal
+        .groupby("subcategoria")
+    )
+
+    mensal["si_rolling"] = (
+        grupo_lag["si_eq_lag"]
+        .transform(
+            lambda s:
+            s.rolling(
+                H,
+                min_periods=H
+            ).sum()
+        )
+    )
+
+    mensal["so_rolling"] = (
+        grupo_lag["so_unid_lag"]
+        .transform(
+            lambda s:
+            s.rolling(
+                H,
+                min_periods=H
+            ).sum()
+        )
+    )
+
+    mensal["r_estoque"] = dividir_seguro(
+        mensal["si_rolling"],
+        mensal["so_rolling"]
+    )
+
+    # Nos primeiros meses, ainda não há 3 meses históricos.
+    # Utilizamos r=1 como neutro e criamos uma flag.
+    mensal["flag_r_neutro"] = (
+        mensal["r_estoque"].isna()
+    )
+
+    mensal["r_estoque"] = (
+        mensal["r_estoque"]
+        .replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+        .fillna(1.0)
+    )
+
+    return mensal
+
+
+# ============================================================
+# 11. FATOR DE ESTOQUE
+# ============================================================
+
+def lambda_por_calibracao(
+    r_star=1.5,
+    f_star=0.60
+):
+
+    if r_star <= 0:
+        raise ValueError(
+            "r_star deve ser > 0."
+        )
+
+    if r_star == 1:
+        raise ValueError(
+            "r_star não pode ser 1."
+        )
+
+    if not (0 < f_star <= 1):
+        raise ValueError(
+            "f_star deve estar entre 0 e 1."
+        )
+
+    return (
+        -np.log(f_star)
+        /
+        (np.log(r_star) ** 2)
+    )
+
+
+def f_estoque(r, lam):
+
+    r = np.asarray(
+        r,
+        dtype=float
+    )
+
+    r = np.where(
+        r > 0,
+        r,
+        np.nan
+    )
+
+    return np.exp(
+        -lam * np.log(r) ** 2
+    )
+
+
+# ============================================================
+# 12. FATOR DE SATURAÇÃO
+# ============================================================
+
+def f_saturacao(x):
+
+    x = np.asarray(
+        x,
+        dtype=float
+    )
+
+    resultado = np.ones_like(
+        x,
+        dtype=float
+    )
+
+    mascara = x > 1e-9
+
+    resultado[mascara] = (
+        x[mascara]
+        /
+        np.expm1(x[mascara])
+    )
+
+    return resultado
+
+
+def estimar_kappa_calibrado(
+    carga_star=1.0,
+    fator_star=0.70
+):
+
+    """
+    Resolve aproximadamente:
+
+        x / (e^x - 1) = fator_star
+
+    quando:
+
+        elasticidade × intensidade = carga_star
+
+    """
+
+    if carga_star <= 0:
+        raise ValueError(
+            "carga_star deve ser > 0."
+        )
+
+    if not (0 < fator_star < 1):
+        raise ValueError(
+            "fator_star deve estar entre 0 e 1."
+        )
+
+    # Busca numérica simples
+    x_grid = np.linspace(
+        1e-6,
+        20,
+        200000
+    )
+
+    valores = f_saturacao(
+        x_grid
+    )
+
+    idx = np.argmin(
+        np.abs(
+            valores - fator_star
+        )
+    )
+
+    x = x_grid[idx]
+
+    kappa = (
+        x / carga_star
+    )
+
+    return float(kappa)
+
+
+# ============================================================
+# 13. ESTIMAÇÃO DE KAPPA
+# ============================================================
+
+def estimar_kappa_base(
+    df_elegivel
+):
+
+    """
+    Modelo:
+
+        incremental / baseline
+        =
+        a_i *
+        [1 - exp(-kappa * epsilon * z)]
+
+    Existe uma assíntota a_i por subcategoria.
+    """
+
+    dados = df_elegivel.copy()
+
+    dados = dados[
+        np.isfinite(
+            dados["z"]
+        )
+        &
+        np.isfinite(
+            dados["elasticidade"]
+        )
+        &
+        np.isfinite(
+            dados["baseline_rs"]
+        )
+        &
+        np.isfinite(
+            dados["incremental_rs_so"]
+        )
+    ]
+
+    dados = dados[
+        (dados["z"] > 0)
+        &
+        (dados["elasticidade"] > 0)
+        &
+        (dados["baseline_rs"] > 0)
+    ]
+
+    dados["y"] = dividir_seguro(
+        dados["incremental_rs_so"],
+        dados["baseline_rs"]
+    )
+
+    dados = dados[
+        np.isfinite(dados["y"])
+    ]
+
+    if len(dados) < 5:
+        return None, {}, "amostra_insuficiente"
+
+    subs = sorted(
+        dados["subcategoria"]
+        .unique()
+    )
+
+    idx = {
+        s: i
+        for i, s in enumerate(subs)
+    }
+
+    def modelo(
+        X,
+        kappa,
+        *a
+    ):
+
+        z, eps, s = X
+
+        a = np.asarray(
+            a,
+            dtype=float
+        )
+
+        s = np.asarray(
+            s,
+            dtype=int
+        )
+
+        return (
+            a[s]
+            *
+            (
+                1
+                -
+                np.exp(
+                    -kappa
+                    * eps
+                    * z
+                )
+            )
+        )
+
+    X = (
+        dados["z"].to_numpy(
+            dtype=float
+        ),
+        dados["elasticidade"].to_numpy(
+            dtype=float
+        ),
+        dados["subcategoria"]
+        .map(idx)
+        .to_numpy(
+            dtype=int
+        ),
+    )
+
+    y = dados["y"].to_numpy(
+        dtype=float
+    )
+
+    # Valores iniciais
+    p0 = (
+        [0.5]
+        +
+        [0.5] * len(subs)
+    )
+
+    # Limites para impedir resultados
+    # completamente absurdos.
+    limite_inferior = (
+        [1e-6]
+        +
+        [0.0] * len(subs)
+    )
+
+    limite_superior = (
+        [20.0]
+        +
+        [20.0] * len(subs)
+    )
+
+    try:
+
+        par, _ = curve_fit(
+            modelo,
+            X,
+            y,
+            p0=p0,
+            bounds=(
+                limite_inferior,
+                limite_superior
+            ),
+            maxfev=50000
+        )
+
+    except Exception as erro:
+
+        print(
+            "\nFalha na estimação livre de kappa:"
+        )
+
+        print(erro)
+
+        return (
+            None,
+            {},
+            "falha_estimacao"
+        )
+
+    kappa = float(
+        par[0]
+    )
+
+    assintotas = dict(
+        zip(
+            subs,
+            par[1:]
+        )
+    )
+
+    # Detecta encostamento nos limites.
+    encostado = (
+        kappa <= 1.01e-6
+        or
+        kappa >= 19.99
+    )
+
+    if encostado:
+
+        return (
+            kappa,
+            assintotas,
+            "kappa_no_limite"
+        )
+
+    return (
+        kappa,
+        assintotas,
+        "estimado"
+    )
+
+
+# ============================================================
+# 14. PREPARAÇÃO DOS PARÂMETROS
+# ============================================================
+
+def montar_parametros(
+    df,
+    alfa_subcategoria,
+    r_estoque,
+    metodo_kappa="calibrado"
+):
+
+    dados = df.copy()
+
+    # --------------------------------------------------------
+    # Margem
+    # --------------------------------------------------------
+
+    dados["m"] = (
+        dados["subcategoria"]
+        .map(MARGENS)
+    )
+
+    # --------------------------------------------------------
+    # Elasticidade
+    # --------------------------------------------------------
+
+    dados["elasticidade"] = (
+        dados["subcategoria"]
+        .map(ELASTICIDADES)
+    )
+
+    # --------------------------------------------------------
+    # Alfa
+    # --------------------------------------------------------
+
+    dados = dados.merge(
+        alfa_subcategoria,
+        on="subcategoria",
+        how="left"
+    )
+
+    # --------------------------------------------------------
+    # Estoque
+    # --------------------------------------------------------
+
+    dados = dados.merge(
+        r_estoque[
+            [
+                "subcategoria",
+                "data",
+                "r_estoque",
+                "flag_r_neutro",
+            ]
+        ],
+        on=[
+            "subcategoria",
+            "data"
+        ],
+        how="left"
+    )
+
+    # --------------------------------------------------------
+    # Lambda
+    # --------------------------------------------------------
+
+    lam = lambda_por_calibracao(
+        R_ESTOQUE_STAR,
+        F_ESTOQUE_STAR
+    )
+
+    dados["lambda"] = lam
+
+    # Fator de estoque
+    dados["f_estoque"] = f_estoque(
+        dados["r_estoque"],
+        lam
+    )
+
+    # --------------------------------------------------------
+    # Kappa
+    # --------------------------------------------------------
+
+    if metodo_kappa == "fixo":
+
+        kappa = KAPPA_FIXO
+
+        assintotas = {}
+
+        motivo_kappa = (
+            "valor_fixo"
+        )
+
+    elif metodo_kappa == "estimado":
+
+        elegivel = dados[
+            dados["pagamento_so"] > 0
+        ].copy()
+
+        (
+            kappa_estimado,
+            assintotas,
+            motivo_kappa
+        ) = estimar_kappa_base(
+            elegivel
+        )
+
+        if kappa_estimado is None:
+
+            kappa = estimar_kappa_calibrado(
+                CARGA_PROMOCIONAL_STAR,
+                F_SATURACAO_STAR
+            )
+
+            motivo_kappa = (
+                motivo_kappa
+                +
+                "_fallback_calibrado"
+            )
+
+        else:
+
+            kappa = kappa_estimado
+
+    else:
+
+        # Recomendado
+        kappa = estimar_kappa_calibrado(
+            CARGA_PROMOCIONAL_STAR,
+            F_SATURACAO_STAR
+        )
+
+        assintotas = {}
+
+        motivo_kappa = (
+            "calibrado"
+        )
+
+    dados["kappa"] = kappa
+
+    # --------------------------------------------------------
+    # x e saturação
+    # --------------------------------------------------------
+
+    dados["x_saturacao"] = (
+        dados["kappa"]
+        *
+        dados["elasticidade"]
+        *
+        dados["z"].fillna(0)
+    )
+
+    dados["f_saturacao"] = f_saturacao(
+        dados["x_saturacao"]
+    )
+
+    # --------------------------------------------------------
+    # ROI marginal
+    # --------------------------------------------------------
+
+    dados["eta"] = ETA_PADRAO
+
+    dados["mroi"] = (
+        dados["m"]
+        *
+        dados["alfa"]
+        *
+        dados["roi_so"]
+        *
+        dados["f_estoque"]
+        *
+        dados["f_saturacao"]
+        -
+        1
+        -
+        dados["eta"]
+    )
+
+    # --------------------------------------------------------
+    # ROI de break-even
+    # --------------------------------------------------------
+
+    denominador = (
+        dados["m"]
+        *
+        dados["alfa"]
+        *
+        dados["f_estoque"]
+        *
+        dados["f_saturacao"]
+    )
+
+    dados["roi_breakeven"] = dividir_seguro(
+        1 + dados["eta"],
+        denominador
+    )
+
+    # --------------------------------------------------------
+    # Status econômico
+    # --------------------------------------------------------
+
+    dados["status_mroi"] = np.select(
+        [
+            dados["mroi"] > 0.20,
+            dados["mroi"] > 0,
+            dados["mroi"] <= 0,
+        ],
+        [
+            "Excelente",
+            "Positivo",
+            "Negativo",
+        ],
+        default="Sem dados"
+    )
+
+    dados["status_mroi"] = (
+        dados["status_mroi"]
+        .where(
+            dados["pagamento_so"] > 0,
+            "Sem promoção"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Dados da configuração
+    # --------------------------------------------------------
+
+    controle = {
+        "lambda": lam,
+        "kappa": kappa,
+        "motivo_kappa": motivo_kappa,
+        "assintotas": assintotas,
+    }
+
+    return dados, controle
+
+
+# ============================================================
+# 15. ESTADO MAIS RECENTE DA SUBCATEGORIA
+# ============================================================
+
+def criar_estado_atual(df):
+
+    dados = (
+        df
+        .sort_values("data")
+        .groupby("subcategoria")
+        .tail(1)
+        .copy()
+    )
+
+    colunas = [
+        "subcategoria",
+        "data",
+        "m",
+        "elasticidade",
+        "alfa",
+        "r_estoque",
+        "f_estoque",
+        "z",
+        "x_saturacao",
+        "f_saturacao",
+        "roi_so",
+        "roi_breakeven",
+        "mroi",
+        "pagamento_so",
+        "incremental_rs_so",
+        "baseline_rs",
+        "sell_out_rs",
+        "sell_in_rs",
+        "status_mroi",
+    ]
+
+    colunas = [
+        c
+        for c in colunas
+        if c in dados.columns
+    ]
+
+    return dados[colunas].copy()
+
+
+# ============================================================
+# 16. PARÂMETROS PARA OTIMIZAÇÃO
+# ============================================================
+
+def montar_pool_otimizacao(
+    df
+):
+
+    # Último mês com dados disponíveis
+    ultima_data = df["data"].max()
+
+    atual = (
+        df[
+            df["data"] == ultima_data
+        ]
+        .groupby("subcategoria")
+        .agg(
+            m=("m", "first"),
+            alfa=("alfa", "first"),
+            r=("r_estoque", "first"),
+            f_estoque=("f_estoque", "first"),
+            eps=("elasticidade", "first"),
+            kappa=("kappa", "first"),
+            baseline=("baseline_rs", "sum"),
+            pagamento=("pagamento_so", "sum"),
+            incremental=("incremental_rs_so", "sum"),
+            roi_so=("roi_so", "mean"),
+            eta=("eta", "first"),
+        )
+        .reset_index()
+    )
+
+    # -----------------------------------------------
+    # Intensity: k = kappa * eps / baseline
+    # -----------------------------------------------
+
+    atual["k"] = dividir_seguro(
+        atual["kappa"]
+        * atual["eps"],
+        atual["baseline"]
+    )
+
+    # -----------------------------------------------
+    # Assíntota da curva
+    # -----------------------------------------------
+    #
+    # incremental =
+    # A * [1-exp(-k*B)]
+    #
+    # A =
+    # incremental /
+    # [1-exp(-k*pagamento)]
+    #
+
+    denominador = (
+        1
+        -
+        np.exp(
+            -atual["k"]
+            * atual["pagamento"]
+        )
+    )
+
+    atual["A"] = dividir_seguro(
+        atual["incremental"],
+        denominador
+    )
+
+    # -----------------------------------------------
+    # Filtro de elegibilidade
+    # -----------------------------------------------
+
+    atual["elegivel_otimizacao"] = (
+        (atual["pagamento"] > 0)
+        &
+        (atual["baseline"] > 0)
+        &
+        (atual["incremental"] > 0)
+        &
+        np.isfinite(atual["k"])
+        &
+        (atual["k"] > 0)
+        &
+        np.isfinite(atual["A"])
+        &
+        (atual["A"] > 0)
+    )
+
+    return atual
+
+
+# ============================================================
+# 17. FUNÇÃO DE OTIMIZAÇÃO
+# ============================================================
+
+def otimizar_verba(
+    params,
+    pool,
+    obrigar_gastar=False
+):
+
+    dados = params.copy()
+
+    dados = dados[
+        dados["elegivel_otimizacao"]
+    ].copy()
+
+    if dados.empty:
+
+        print(
+            "\nNenhuma subcategoria possui "
+            "dados elegíveis para otimização."
+        )
+
+        return (
+            pd.DataFrame(),
+            0.0
+        )
+
+    nomes = (
+        dados["subcategoria"]
+        .tolist()
+    )
+
+    k = dados["k"].to_numpy(
+        dtype=float
+    )
+
+    A = dados["A"].to_numpy(
+        dtype=float
+    )
+
+    fator_lucro = (
+        dados["m"]
+        *
+        dados["alfa"]
+        *
+        dados["f_estoque"]
+    ).to_numpy(
+        dtype=float
+    )
+
+    eta = dados["eta"].to_numpy(
+        dtype=float
+    )
+
+    if pool <= 0:
+
+        return (
+            pd.DataFrame(),
+            0.0
+        )
+
+    # --------------------------------------------------------
+    # Limites
+    # --------------------------------------------------------
+
+    # Para evitar uma concentração irreal,
+    # cada subcategoria pode receber até 50%
+    # do pool.
+    #
+    # Isso é apenas um default de proteção.
+    #
+    limite_maximo = pool * 0.50
+
+    limites = [
+        (
+            0.0,
+            limite_maximo
+        )
+        for _ in nomes
+    ]
+
+    # --------------------------------------------------------
+    # Lucro
+    # --------------------------------------------------------
+
+    def lucro(B):
+
+        incremental_modelado = (
+            A
+            *
+            (
+                1
+                -
+                np.exp(
+                    -k * B
+                )
+            )
+        )
+
+        receita_lucro = (
+            fator_lucro
+            *
+            incremental_modelado
+        )
+
+        custo_verba = (
+            (1 + eta)
+            *
+            B
+        )
+
+        return np.sum(
+            receita_lucro
+            -
+            custo_verba
+        )
+
+    def objetivo(B):
+        return -lucro(B)
+
+    # --------------------------------------------------------
+    # Chute inicial
+    # --------------------------------------------------------
+
+    n = len(nomes)
+
+    B0 = np.full(
+        n,
+        pool / n
+    )
+
+    B0 = np.minimum(
+        B0,
+        limite_maximo
+    )
+
+    # Ajusta o chute para que a soma fique igual ao pool
+    if B0.sum() < pool:
+
+        B0 = np.full(
+            n,
+            limite_maximo
+        )
+
+        diferenca = (
+            pool
+            -
+            B0.sum()
+        )
+
+        if diferenca > 0:
+            # libera a restrição simplesmente
+            # usando distribuição igual
+            B0 = np.full(
+                n,
+                pool / n
+            )
+
+    # --------------------------------------------------------
+    # Restrição
+    # --------------------------------------------------------
+
+    if obrigar_gastar:
+
+        restricoes = [
+            {
+                "type": "eq",
+                "fun": lambda B:
+                np.sum(B) - pool
+            }
+        ]
+
+    else:
+
+        # Caso não seja obrigatório gastar,
+        # acrescentamos a opção de "não gastar".
+        #
+        # Para SLSQP, usamos <= pool.
+        restricoes = [
+            {
+                "type": "ineq",
+                "fun": lambda B:
+                pool - np.sum(B)
+            }
+        ]
+
+    # --------------------------------------------------------
+    # Otimização
+    # --------------------------------------------------------
+
+    res = minimize(
+        objetivo,
+        B0,
+        bounds=limites,
+        constraints=restricoes,
+        method="SLSQP",
+        options={
+            "maxiter": 2000,
+            "ftol": 1e-8,
+            "disp": False,
+        }
+    )
+
+    if not res.success:
+
+        print(
+            "\nAVISO:"
+        )
+
+        print(
+            "O otimizador não convergiu perfeitamente."
+        )
+
+        print(
+            f"Mensagem: {res.message}"
+        )
+
+    B = np.maximum(
+        res.x,
+        0
+    )
+
+    # --------------------------------------------------------
+    # Resultado
+    # --------------------------------------------------------
+
+    resultado = dados[
+        [
+            "subcategoria",
+            "m",
+            "alfa",
+            "r",
+            "f_estoque",
+            "eps",
+            "kappa",
+            "baseline",
+            "pagamento",
+            "incremental",
+            "roi_so",
+            "elegivel_otimizacao",
+        ]
+    ].copy()
+
+    resultado["verba_otima"] = B
+
+    resultado["incremental_modelado"] = (
+        resultado["A"].to_numpy()
+        *
+        (
+            1
+            -
+            np.exp(
+                -resultado["k"].to_numpy()
+                * B
+            )
+        )
+        if "A" in resultado.columns
+        else 0
+    )
+
+    resultado["receita_lucro_modelado"] = (
+        resultado["m"]
+        *
+        resultado["alfa"]
+        *
+        resultado["f_estoque"]
+        *
+        resultado["incremental_modelado"]
+    )
+
+    resultado["custo_verba"] = (
+        (1 + ETA_PADRAO)
+        *
+        resultado["verba_otima"]
+    )
+
+    resultado["lucro_incremental"] = (
+        resultado["receita_lucro_modelado"]
+        -
+        resultado["custo_verba"]
+    )
+
+    resultado["mroi_alocacao"] = dividir_seguro(
+        resultado["lucro_incremental"],
+        resultado["verba_otima"]
+    )
+
+    resultado["participacao_verba"] = dividir_seguro(
+        resultado["verba_otima"],
+        resultado["verba_otima"].sum()
+    )
+
+    resultado = resultado.sort_values(
+        "verba_otima",
+        ascending=False
+    )
+
+    lucro_total = (
+        resultado["lucro_incremental"]
+        .sum()
+    )
+
+    return resultado, float(
+        lucro_total
+    )
+
+
+# ============================================================
+# 18. BREAK-EVEN
+# ============================================================
+
+def calcular_breakeven_atual(
+    df
+):
+
+    estado = criar_estado_atual(
+        df
+    )
+
+    estado["roi_so_breakeven"] = (
+        estado["roi_breakeven"]
+    )
+
+    estado["ganho_vs_breakeven"] = (
+        estado["roi_so"]
+        -
+        estado["roi_so_breakeven"]
+    )
+
+    estado["acima_do_breakeven"] = (
+        estado["roi_so"]
+        >=
+        estado["roi_so_breakeven"]
+    )
+
+    return estado
+
+
+# ============================================================
+# 19. DIAGNÓSTICO
+# ============================================================
+
+def criar_diagnostico(
+    df,
+    controle
+):
+
+    problemas = []
+
+    for _, linha in df.iterrows():
+
+        sub = linha["subcategoria"]
+
+        if sub not in MARGENS:
+
+            problemas.append(
+                {
+                    "tipo": "Margem",
+                    "subcategoria": sub,
+                    "data": linha["data"],
+                    "problema": (
+                        "Subcategoria sem margem configurada."
+                    ),
+                }
+            )
+
+        if sub not in ELASTICIDADES:
+
+            problemas.append(
+                {
+                    "tipo": "Elasticidade",
+                    "subcategoria": sub,
+                    "data": linha["data"],
+                    "problema": (
+                        "Subcategoria sem elasticidade configurada."
+                    ),
+                }
+            )
+
+        if linha["baseline_rs"] <= 0:
+
+            problemas.append(
+                {
+                    "tipo": "Baseline",
+                    "subcategoria": sub,
+                    "data": linha["data"],
+                    "problema": (
+                        "Baseline Sell-Out menor ou igual a zero."
+                    ),
+                }
+            )
+
+        if (
+            linha["pagamento_so"] > 0
+            and not np.isfinite(
+                linha["roi_so"]
+            )
+        ):
+
+            problemas.append(
+                {
+                    "tipo": "ROI",
+                    "subcategoria": sub,
+                    "data": linha["data"],
+                    "problema": (
+                        "Pagamento positivo, mas ROI "
+                        "não pôde ser calculado."
+                    ),
+                }
+            )
+
+        if linha["flag_r_neutro"]:
+
+            problemas.append(
+                {
+                    "tipo": "Estoque",
+                    "subcategoria": sub,
+                    "data": linha["data"],
+                    "problema": (
+                        "SI/SO inicializado em 1 por falta "
+                        "de histórico suficiente."
+                    ),
+                }
+            )
+
+    diagnostico = pd.DataFrame(
+        problemas
+    )
+
+    if diagnostico.empty:
+
+        diagnostico = pd.DataFrame(
+            {
+                "tipo": ["OK"],
+                "subcategoria": [""],
+                "data": [""],
+                "problema": [
+                    "Nenhum problema estrutural encontrado."
+                ],
+            }
+        )
+
+    # Adiciona controle
+    resumo = pd.DataFrame(
+        {
+            "parametro": [
+                "Lambda",
+                "Kappa",
+                "Metodo Kappa",
+                "Janela Estoque",
+                "Janela Alfa",
+                "r_star",
+                "f_estoque_star",
+                "carga_promocional_star",
+                "f_saturacao_star",
+            ],
+            "valor": [
+                controle["lambda"],
+                controle["kappa"],
+                controle["motivo_kappa"],
+                JANELA_ESTOQUE,
+                JANELA_ALFA,
+                R_ESTOQUE_STAR,
+                F_ESTOQUE_STAR,
+                CARGA_PROMOCIONAL_STAR,
+                F_SATURACAO_STAR,
+            ],
+        }
+    )
+
+    return diagnostico, resumo
+
+
+# ============================================================
+# 20. FORMATAÇÃO DO EXCEL
+# ============================================================
+
+def formatar_excel(
+    caminho,
+    abas
+):
+
+    from openpyxl import load_workbook
+    from openpyxl.styles import (
+        Font,
+        PatternFill,
+        Alignment,
+        Border,
+        Side,
+    )
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(
+        caminho
+    )
+
+    # Cores
+    azul_escuro = "17365D"
+    azul_claro = "D9EAF7"
+    cinza = "D9E1F2"
+    vermelho_claro = "F4CCCC"
+    verde_claro = "D9EAD3"
+    amarelo = "FFF2CC"
+
+    branco = "FFFFFF"
+    preto = "000000"
+
+    borda = Side(
+        style="thin",
+        color="B7B7B7"
+    )
+
+    for nome_aba in wb.sheetnames:
+
+        ws = wb[nome_aba]
+
+        ws.sheet_view.showGridLines = False
+
+        # Cabeçalho
+        for cell in ws[1]:
+
+            cell.fill = PatternFill(
+                "solid",
+                fgColor=azul_escuro
+            )
+
+            cell.font = Font(
+                color=branco,
+                bold=True
+            )
+
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center"
+            )
+
+            cell.border = Border(
+                bottom=borda
+            )
+
+        # Autofiltro
+        ws.auto_filter.ref = ws.dimensions
+
+        # Congelar cabeçalho
+        ws.freeze_panes = "A2"
+
+        # Largura
+        for col_idx, coluna in enumerate(
+            ws.columns,
+            start=1
+        ):
+
+            valores = []
+
+            for cell in coluna:
+
+                if cell.value is not None:
+                    valores.append(
+                        str(cell.value)
+                    )
+
+            if valores:
+
+                largura = min(
+                    max(
+                        len(x)
+                        for x in valores
+                    ) + 2,
+                    35
+                )
+
+                ws.column_dimensions[
+                    get_column_letter(
+                        col_idx
+                    )
+                ].width = largura
+
+        # Formatação de números
+        cabecalhos = [
+            cell.value
+            for cell in ws[1]
+        ]
+
+        for idx, cab in enumerate(
+            cabecalhos,
+            start=1
+        ):
+
+            if cab is None:
+                continue
+
+            cab_str = str(
+                cab
+            ).lower()
+
+            for row in range(
+                2,
+                ws.max_row + 1
+            ):
+
+                cell = ws.cell(
+                    row=row,
+                    column=idx
+                )
+
+                # Valores monetários
+                if (
+                    "r$" in cab_str
+                    or
+                    "verba" in cab_str
+                    or
+                    "lucro" in cab_str
+                    or
+                    "receita" in cab_str
+                    or
+                    "pagamento" in cab_str
+                    or
+                    "incremental" in cab_str
+                    and "$" in cab_str
+                ):
+
+                    cell.number_format = (
+                        'R$ #,##0.00;'
+                        '[Red](R$ #,##0.00);-'
+                    )
+
+                # Percentuais
+                elif (
+                    "%" in cab_str
+                    or
+                    cab_str.startswith("mroi")
+                    or
+                    "margem" in cab_str
+                    or
+                    "participacao" in cab_str
+                ):
+
+                    cell.number_format = (
+                        '0.0%;'
+                        '[Red](0.0%);-'
+                    )
+
+                # Múltiplos
+                elif (
+                    "roi_so" in cab_str
+                    or
+                    "roi_breakeven" in cab_str
+                ):
+
+                    cell.number_format = (
+                        '0.00x;'
+                        '[Red](0.00x);-'
+                    )
+
+                # Números
+                else:
+
+                    if isinstance(
+                        cell.value,
+                        (int, float)
+                    ):
+
+                        cell.number_format = (
+                            '#,##0.00;'
+                            '[Red](#,##0.00);-'
+                        )
+
+        # Coloração especial para status
+        for row in ws.iter_rows(
+            min_row=2
+        ):
+
+            for cell in row:
+
+                valor = (
+                    str(cell.value)
+                    .strip()
+                    .lower()
+                )
+
+                if valor in {
+                    "excelente",
+                    "positivo"
+                }:
+
+                    cell.fill = PatternFill(
+                        "solid",
+                        fgColor=verde_claro
+                    )
+
+                elif valor == "negativo":
+
+                    cell.fill = PatternFill(
+                        "solid",
+                        fgColor=vermelho_claro
+                    )
+
+                elif (
+                    "sem promoção"
+                    in valor
+                ):
+
+                    cell.fill = PatternFill(
+                        "solid",
+                        fgColor=cinza
+                    )
+
+    wb.save(
+        caminho
+    )
+
+
+# ============================================================
+# 21. EXPORTAÇÃO
+# ============================================================
+
+def exportar_excel(
+    caminho_saida,
+    df_modelado,
+    estado_atual,
+    breakeven,
+    parametros_otimizacao,
+    alocacao,
+    diagnostico,
+    resumo_controle,
+):
+
+    print("\n")
+    print("=" * 70)
+    print("GERANDO EXCEL")
+    print("=" * 70)
+
+    with pd.ExcelWriter(
+        caminho_saida,
+        engine="openpyxl"
+    ) as writer:
+
+        df_modelado.to_excel(
+            writer,
+            sheet_name="Base_Modelada",
+            index=False
+        )
+
+        estado_atual.to_excel(
+            writer,
+            sheet_name="Estado_Atual",
+            index=False
+        )
+
+        breakeven.to_excel(
+            writer,
+            sheet_name="BreakEven",
+            index=False
+        )
+
+        parametros_otimizacao.to_excel(
+            writer,
+            sheet_name="Parametros_Otimizacao",
+            index=False
+        )
+
+        if not alocacao.empty:
+
+            alocacao.to_excel(
+                writer,
+                sheet_name="Alocacao_Otima",
+                index=False
+            )
+
+        diagnostico.to_excel(
+            writer,
+            sheet_name="Diagnostico",
+            index=False
+        )
+
+        resumo_controle.to_excel(
+            writer,
+            sheet_name="Controle_Modelo",
+            index=False
+        )
+
+    formatar_excel(
+        caminho_saida,
+        None
+    )
+
+    print(
+        f"\nArquivo gerado com sucesso:"
+    )
+
+    print(
+        Path(
+            caminho_saida
+        ).resolve()
+    )
+
+
+# ============================================================
+# 22. RESUMO EXECUTIVO NO TERMINAL
+# ============================================================
+
+def imprimir_resumo(
+    df_modelado,
+    estado_atual,
+    alocacao,
+    lucro_total,
+    controle
+):
+
+    print("\n")
+    print("=" * 70)
+    print("RESUMO EXECUTIVO DO MODELO")
+    print("=" * 70)
+
+    print(
+        f"\nPeríodo inicial: "
+        f"{df_modelado['data'].min().date()}"
+    )
+
+    print(
+        f"Período final:   "
+        f"{df_modelado['data'].max().date()}"
+    )
+
+    print(
+        f"\nSubcategorias:"
+    )
+
+    for sub in sorted(
+        df_modelado["subcategoria"]
+        .dropna()
+        .unique()
+    ):
+
+        print(
+            f"  - {sub}"
+        )
+
+    print(
+        f"\nLambda estoque: "
+        f"{controle['lambda']:.6f}"
+    )
+
+    print(
+        f"Kappa: "
+        f"{controle['kappa']:.6f}"
+    )
+
+    print(
+        f"Método Kappa: "
+        f"{controle['motivo_kappa']}"
+    )
+
+    print(
+        "\nMROI atual por subcategoria:"
+    )
+
+    colunas = [
+        "subcategoria",
+        "mroi",
+        "roi_so",
+        "roi_breakeven",
+        "r_estoque",
+        "alfa",
+        "f_estoque",
+        "f_saturacao",
+    ]
+
+    resumo = (
+        estado_atual[
+            colunas
+        ]
+        .sort_values(
+            "mroi",
+            ascending=False
+        )
+    )
+
+    for _, linha in resumo.iterrows():
+
+        print(
+            f"\n{linha['subcategoria']}"
+        )
+
+        print(
+            f"  MROI:              "
+            f"{linha['mroi']:.4f}"
+        )
+
+        print(
+            f"  ROI Sell-Out:      "
+            f"{linha['roi_so']:.4f}"
+            if np.isfinite(
+                linha["roi_so"]
+            )
+            else
+            "  ROI Sell-Out:      N/A"
+        )
+
+        print(
+            f"  ROI Break-even:    "
+            f"{linha['roi_breakeven']:.4f}"
+            if np.isfinite(
+                linha["roi_breakeven"]
+            )
+            else
+            "  ROI Break-even:    N/A"
+        )
+
+        print(
+            f"  SI/SO:             "
+            f"{linha['r_estoque']:.4f}"
+        )
+
+        print(
+            f"  Alfa:              "
+            f"{linha['alfa']:.4f}"
+            if np.isfinite(
+                linha["alfa"]
+            )
+            else
+            "  Alfa:              N/A"
+        )
+
+        print(
+            f"  Fator estoque:     "
+            f"{linha['f_estoque']:.4f}"
+        )
+
+        print(
+            f"  Fator saturação:   "
+            f"{linha['f_saturacao']:.4f}"
+        )
+
+    if not alocacao.empty:
+
+        print("\n")
+        print(
+            "=" * 70
+        )
+
+        print(
+            "ALOCACAO OTIMA"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        for _, linha in alocacao.iterrows():
+
+            print(
+                f"\n{linha['subcategoria']}"
+            )
+
+            print(
+                f"  Verba ótima:       "
+                f"R$ {linha['verba_otima']:,.2f}"
+            )
+
+            print(
+                f"  Lucro incremental: "
+                f"R$ {linha['lucro_incremental']:,.2f}"
+            )
+
+            print(
+                f"  MROI alocado:      "
+                f"{linha['mroi_alocacao']:.4f}"
+            )
+
+        print(
+            f"\nLucro incremental total: "
+            f"R$ {lucro_total:,.2f}"
+        )
+
+
+# ============================================================
+# 23. EXECUÇÃO PRINCIPAL
+# ============================================================
+
+def main():
+
+    print("\n")
+    print("=" * 70)
+    print(
+        "MODELO DE MROI - FMCG"
+    )
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Passo 1 - Ler Excel
+    # --------------------------------------------------------
+
+    df_raw = ler_excel(
+        ARQUIVO_BASE,
+        ABA_EXCEL
+    )
+
+    # --------------------------------------------------------
+    # Passo 2 - Padronizar
+    # --------------------------------------------------------
+
+    df = preparar_base(
+        df_raw
+    )
+
+    print(
+        f"\nLinhas após preparação: "
+        f"{len(df):,}"
+    )
+
+    # --------------------------------------------------------
+    # Passo 3 - Fator IT
+    # --------------------------------------------------------
+
+    df = adicionar_fator_it_unidade(
+        df
+    )
+
+    # --------------------------------------------------------
+    # Passo 4 - Variáveis básicas
+    # --------------------------------------------------------
+
+    df = calcular_variaveis_basicas(
+        df
+    )
+
+    # --------------------------------------------------------
+    # Passo 5 - Alfa
+    # --------------------------------------------------------
+
+    print(
+        "\nCalculando alfa..."
+    )
+
+    _, alfa_subcategoria = (
+        calcular_alfa(
+            df,
+            janela=JANELA_ALFA
+        )
+    )
+
+    # --------------------------------------------------------
+    # Passo 6 - SI/SO
+    # --------------------------------------------------------
+
+    print(
+        "Calculando SI/SO..."
+    )
+
+    r_estoque = calcular_r_estoque(
+        df,
+        H=JANELA_ESTOQUE
+    )
+
+    # --------------------------------------------------------
+    # Passo 7 - Parâmetros do modelo
+    # --------------------------------------------------------
+
+    print(
+        "Montando fatores econômicos..."
+    )
+
+    df, controle = montar_parametros(
+        df,
+        alfa_subcategoria,
+        r_estoque,
+        metodo_kappa=METODO_KAPPA
+    )
+
+    # --------------------------------------------------------
+    # Passo 8 - Estado atual
+    # --------------------------------------------------------
+
+    estado_atual = criar_estado_atual(
+        df
+    )
+
+    # --------------------------------------------------------
+    # Passo 9 - Break-even
+    # --------------------------------------------------------
+
+    breakeven = calcular_breakeven_atual(
+        df
+    )
+
+    # --------------------------------------------------------
+    # Passo 10 - Parâmetros para otimização
+    # --------------------------------------------------------
+
+    parametros_otimizacao = (
+        montar_pool_otimizacao(
+            df
+        )
+    )
+
+    # --------------------------------------------------------
+    # Passo 11 - Otimização
+    # --------------------------------------------------------
+
+    alocacao = pd.DataFrame()
+    lucro_total = 0.0
+
+    if ORCAMENTO_TOTAL > 0:
+
+        print(
+            "\nOtimizando orçamento..."
+        )
+
+        alocacao, lucro_total = (
+            otimizar_verba(
+                parametros_otimizacao,
+                ORCAMENTO_TOTAL,
+                OBRIGAR_GASTAR_TODO_ORCAMENTO
+            )
+        )
+
+    else:
+
+        print(
+            "\nORCAMENTO_TOTAL = 0."
+        )
+
+        print(
+            "Apenas análise do MROI será executada."
+        )
+
+    # --------------------------------------------------------
+    # Passo 12 - Diagnóstico
+    # --------------------------------------------------------
+
+    diagnostico, resumo_controle = (
+        criar_diagnostico(
+            df,
+            controle
+        )
+    )
+
+    # --------------------------------------------------------
+    # Passo 13 - Exportar
+    # --------------------------------------------------------
+
+    exportar_excel(
+        ARQUIVO_SAIDA,
+        df,
+        estado_atual,
+        breakeven,
+        parametros_otimizacao,
+        alocacao,
+        diagnostico,
+        resumo_controle,
+    )
+
+    # --------------------------------------------------------
+    # Passo 14 - Resumo
+    # --------------------------------------------------------
+
+    imprimir_resumo(
+        df,
+        estado_atual,
+        alocacao,
+        lucro_total,
+        controle
+    )
+
+    print("\n")
+    print("=" * 70)
+    print(
+        "PROCESSAMENTO CONCLUIDO"
+    )
+    print("=" * 70)
+
+
+# ============================================================
+# 24. EXECUTA
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
